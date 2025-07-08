@@ -2638,7 +2638,7 @@ class SharepointOnlineDataSource(BaseDataSource):
         :return: the access control list (ACL) for this "member"
 
         Detect when a member has the login name: c:0-.f|rolemanager|spo-grid-all-users. 
-        Map it to a standard identifier in _allow_access_control, for example: group:EveryoneExceptExternalUsers
+        Map it to a standard identifier in _allow_access_control
         """
         login_name = member.get("LoginName")
 
