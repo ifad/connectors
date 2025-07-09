@@ -2643,7 +2643,7 @@ class SharepointOnlineDataSource(BaseDataSource):
         login_name = member.get("LoginName")
 
         # Handle "Everyone Except External Users" group
-        if login_name == "c:0-.f|rolemanager|spo-grid-all-users":
+        if login_name and login_name.startswith("c:0-.f|rolemanager|spo-grid-all-users"):
             self._logger.debug(f"Detected 'Everyone Except External Users' group: '{member.get('Title')}'.")
             return ["group:EveryoneExceptExternalUsers"]
 
