@@ -1400,6 +1400,15 @@ class SharepointOnlineDataSource(BaseDataSource):
                 "type": "bool",
                 "value": True,
             },
+            "enrich_metadata": {
+                "display": "toggle",
+                "label": "Enrich documents with metadata",
+                "order": 17,
+                "tooltip": "Enable this option to enrich all documents with structured metadata including category, division, content type, and other SharePoint managed properties. The metadata will be stored as an array of key-value pairs in a 'metadata' field.",
+                "type": "bool",
+                "value": True,
+                "ui_restrictions": ["advanced"],
+            },
         }
 
     async def validate_config(self):
@@ -1460,6 +1469,235 @@ class SharepointOnlineDataSource(BaseDataSource):
                 set(document.get(ACCESS_CONTROL, []) + access_control)
             )
 
+        return document
+
+    def _extract_metadata_from_sharepoint_fields(self, document, site=None, site_drive=None, site_list=None):
+        """
+        Extract metadata from SharePoint fields and map them to standardized metadata structure.
+        
+        Args:
+            document: The SharePoint document/item
+            site: Site information (optional)
+            site_drive: Drive information (optional) 
+            site_list: List information (optional)
+            
+        Returns:
+            dict: Extracted metadata as key-value pairs
+        """
+        metadata = {}
+        
+
+        fields = document.get("fields", {})
+        
+        # Map SharePoint managed properties to your metadata structure
+        # Based on your SEARCH Managed properties table
+        # Category mapping
+        odc_category = fields.get("OPDCategory") or fields.get("ODCCategory")
+        if odc_category:
+            metadata["Category"] = odc_category
+        else:
+            # Try to determine category from site URL or other indicators
+            if site and site.get("webUrl"):
+                site_url = site["webUrl"].lower()
+                if "odc" in site_url:
+                    metadata["Category"] = "ODC"
+                elif "xdesk" in site_url:
+                    metadata["Category"] = "Xdesk"
+                else:
+                    metadata["Category"] = None
+            else:
+                metadata["Category"] = None
+        
+        # Business Unit / Division
+        metadata["Division"] = fields.get("BusinessUnit")
+        metadata["Department"] = fields.get("BusinessUnit")  # Using same field as Department
+        
+        # Document Type
+        metadata["Content-Type"] = fields.get("DocumentType") or self._determine_content_type(document)
+        
+        # Activity and Project information
+        metadata["ActivityID"] = fields.get("ActivityID")
+        metadata["ActivityName"] = fields.get("ActivityName")
+        metadata["ProjectID"] = fields.get("ProjectID")
+        metadata["ProjectType"] = fields.get("ProjectType")
+        
+        # Geographic and temporal metadata
+        metadata["Region"] = fields.get("Region")
+        metadata["FocusCountry"] = fields.get("FocusCountry")
+        metadata["Year"] = fields.get("Year")
+        metadata["Phase"] = fields.get("Phase")
+        
+        # Status and classification
+        metadata["Status"] = fields.get("OPDStatus")
+        metadata["GrantType"] = fields.get("GrantType")
+        metadata["GrantWindow"] = fields.get("GrantWindow")
+        
+        # Boolean flags
+        metadata["Disclosable"] = fields.get("Disclosable")
+        metadata["NonIFAD"] = fields.get("NonIfad")
+        metadata["PLF"] = fields.get("PLF")
+        
+        # System information
+        metadata["SystemSource"] = fields.get("ODCIntegration_SystemSource")
+        
+        return metadata
+
+    def _determine_content_type(self, document):
+        """
+        Determine content type based on document properties.
+        
+        Args:
+            document: The SharePoint document
+            
+        Returns:
+            str: Content type classification
+        """
+        object_type = document.get("object_type", "")
+        
+        if object_type == "drive_item":
+            name = document.get("name", "")
+            if "folder" in document:
+                return "Folder"
+            elif name:
+                ext = os.path.splitext(name)[-1].lower()
+                if ext in ['.ppt', '.pptx']:
+                    return "Presentation"
+                elif ext in ['.doc', '.docx', '.pdf']:
+                    return "Document"
+                elif ext in ['.xls', '.xlsx']:
+                    return "Spreadsheet"
+                elif ext in ['.mp4', '.avi', '.mov']:
+                    return "Video"
+                elif ext in ['.jpg', '.jpeg', '.png', '.gif']:
+                    return "Image"
+                else:
+                    return "Document"
+        elif object_type == "site_page":
+            return "Web Page"
+        elif object_type == "list_item":
+            return "List Item"
+        elif object_type == "list_item_attachment":
+            return "Attachment"
+        else:
+            return "Document"
+
+    def _build_metadata_array(self, document, site=None, site_drive=None, site_list=None):
+        """
+        Build metadata array as key-value pairs for the document.
+        
+        Args:
+            document: The SharePoint document
+            site: Site context
+            site_drive: Drive context  
+            site_list: List context
+            
+        Returns:
+            list: Array of metadata key-value pairs
+        """
+        metadata_pairs = []
+        
+        # Extract SharePoint-specific metadata
+        sharepoint_metadata = self._extract_metadata_from_sharepoint_fields(
+            document, site, site_drive, site_list
+        )
+        
+        # Standard metadata that should always be present
+        
+        # Site Name
+        site_name = None
+        if site:
+            site_name = site.get("displayName") or site.get("name") or site.get("title")
+        metadata_pairs.append({"key": "Site Name", "value": site_name})
+        
+        # Document Library / Drive Name
+        library_name = None
+        if site_drive:
+            library_name = site_drive.get("name") or site_drive.get("displayName")
+        elif site_list:
+            library_name = site_list.get("name") or site_list.get("displayName")
+        metadata_pairs.append({"key": "Document Library", "value": library_name})
+        
+        # File Type/Extension
+        file_extension = None
+        file_name = document.get("name") or document.get("_original_filename") or document.get("FileName", "")
+        if file_name and "." in file_name:
+            file_extension = os.path.splitext(file_name)[-1].lower()
+        metadata_pairs.append({"key": "File Type", "value": file_extension})
+        
+        # File Path/Location
+        file_path = None
+        if document.get("webUrl"):
+            file_path = document["webUrl"]
+        elif document.get("parentReference", {}).get("path"):
+            file_path = document["parentReference"]["path"]
+        elif site and site.get("webUrl"):
+            # Construct path from site URL and document name
+            site_path = self._site_path_from_web_url(site["webUrl"])
+            if file_name:
+                file_path = f"{site_path}/{file_name}"
+            else:
+                file_path = site_path
+        metadata_pairs.append({"key": "File Path", "value": file_path})
+        
+        # Add all SharePoint metadata fields
+        for key, value in sharepoint_metadata.items():
+            metadata_pairs.append({"key": key, "value": value})
+        
+        # Additional technical metadata
+        metadata_pairs.append({"key": "Object Type", "value": document.get("object_type")})
+        metadata_pairs.append({"key": "Document ID", "value": document.get("_id")})
+        metadata_pairs.append({"key": "Last Modified", "value": document.get("_timestamp") or document.get("lastModifiedDateTime")})
+        
+        # Size information for files
+        if document.get("size"):
+            metadata_pairs.append({"key": "File Size", "value": document.get("size")})
+        
+        # Creator information
+        created_by = None
+        if document.get("createdBy", {}).get("user", {}).get("displayName"):
+            created_by = document["createdBy"]["user"]["displayName"]
+        elif document.get("createdBy", {}).get("user", {}).get("email"):
+            created_by = document["createdBy"]["user"]["email"]
+        metadata_pairs.append({"key": "Created By", "value": created_by})
+        
+        # Modified by information  
+        modified_by = None
+        if document.get("lastModifiedBy", {}).get("user", {}).get("displayName"):
+            modified_by = document["lastModifiedBy"]["user"]["displayName"]
+        elif document.get("lastModifiedBy", {}).get("user", {}).get("email"):
+            modified_by = document["lastModifiedBy"]["user"]["email"]
+        metadata_pairs.append({"key": "Modified By", "value": modified_by})
+        
+        return metadata_pairs
+
+    def _enrich_document_with_metadata(self, document, site=None, site_drive=None, site_list=None):
+        """
+        Enrich document with metadata array.
+        
+        Args:
+            document: The document to enrich
+            site: Site context
+            site_drive: Drive context
+            site_list: List context
+            
+        Returns:
+            dict: Document enriched with metadata
+        """
+        # Check if metadata enrichment is enabled
+        if not self.configuration.get("enrich_metadata", True):
+            return document
+            
+        try:
+            metadata_array = self._build_metadata_array(document, site, site_drive, site_list)
+            document["metadata"] = metadata_array
+            
+            self._logger.debug(f"Enriched document {document.get('_id')} with {len(metadata_array)} metadata pairs")
+            
+        except Exception as e:
+            self._logger.warning(f"Failed to enrich document {document.get('_id')} with metadata: {str(e)}")
+            # Ensure at least an empty metadata array
+            document["metadata"] = []
+        
         return document
 
     async def _site_access_control(self, site):
@@ -1751,6 +1989,8 @@ class SharepointOnlineDataSource(BaseDataSource):
             max_drive_item_age = advanced_rules["skipExtractingDriveItemsOlderThan"]
 
         async for site_collection in self.site_collections():
+            # Enrich site collection with metadata
+            site_collection = self._enrich_document_with_metadata(site_collection)
             yield site_collection, None
 
             async for site in self.sites(
@@ -1762,16 +2002,26 @@ class SharepointOnlineDataSource(BaseDataSource):
                     site_admin_access_control,
                 ) = await self._site_access_control(site)
 
+                # Enrich site with metadata and access control
+                enriched_site = self._enrich_document_with_metadata(site)
+                enriched_site = self._decorate_with_access_control(enriched_site, site_access_control)
+
                 yield (
-                    self._decorate_with_access_control(site, site_access_control),
+                    enriched_site,
                     None,
                 )
 
                 async for site_drive in self.site_drives(site):
+                    # Enrich site drive with metadata and access control
+                    enriched_site_drive = self._enrich_document_with_metadata(
+                        site_drive, site=site, site_drive=site_drive
+                    )
+                    enriched_site_drive = self._decorate_with_access_control(
+                        enriched_site_drive, site_access_control
+                    )
+                    
                     yield (
-                        self._decorate_with_access_control(
-                            site_drive, site_access_control
-                        ),
+                        enriched_site_drive,
                         None,
                     )
 
@@ -1788,6 +2038,11 @@ class SharepointOnlineDataSource(BaseDataSource):
                                 drive_item["object_type"] = "drive_item"
                                 drive_item["_timestamp"] = drive_item.get(
                                     "lastModifiedDateTime"
+                                )
+
+                                # Enrich with metadata
+                                drive_item = self._enrich_document_with_metadata(
+                                    drive_item, site=site, site_drive=site_drive
                                 )
 
                                 # Drive items should inherit site access controls only if
@@ -1853,6 +2108,8 @@ class SharepointOnlineDataSource(BaseDataSource):
             max_drive_item_age = advanced_rules["skipExtractingDriveItemsOlderThan"]
 
         async for site_collection in self.site_collections():
+            # Enrich site collection with metadata
+            site_collection = self._enrich_document_with_metadata(site_collection)
             yield site_collection, None, OP_INDEX
 
             async for site in self.sites(
@@ -1865,8 +2122,12 @@ class SharepointOnlineDataSource(BaseDataSource):
                     site_admin_access_control,
                 ) = await self._site_access_control(site)
 
+                # Enrich site with metadata and access control
+                enriched_site = self._enrich_document_with_metadata(site)
+                enriched_site = self._decorate_with_access_control(enriched_site, site_access_control)
+
                 yield (
-                    self._decorate_with_access_control(site, site_access_control),
+                    enriched_site,
                     None,
                     OP_INDEX,
                 )
@@ -1875,10 +2136,16 @@ class SharepointOnlineDataSource(BaseDataSource):
                 # lastModifiedDateTime of the parent site_drive. Therefore, we
                 # set check_timestamp to False when iterating over site_drives.
                 async for site_drive in self.site_drives(site, check_timestamp=False):
+                    # Enrich site drive with metadata and access control
+                    enriched_site_drive = self._enrich_document_with_metadata(
+                        site_drive, site=site, site_drive=site_drive
+                    )
+                    enriched_site_drive = self._decorate_with_access_control(
+                        enriched_site_drive, site_access_control
+                    )
+                    
                     yield (
-                        self._decorate_with_access_control(
-                            site_drive, site_access_control
-                        ),
+                        enriched_site_drive,
                         None,
                         OP_INDEX,
                     )
@@ -1900,6 +2167,11 @@ class SharepointOnlineDataSource(BaseDataSource):
                                 drive_item["object_type"] = "drive_item"
                                 drive_item["_timestamp"] = drive_item.get(
                                     "lastModifiedDateTime"
+                                )
+
+                                # Enrich with metadata
+                                drive_item = self._enrich_document_with_metadata(
+                                    drive_item, site=site, site_drive=site_drive
                                 )
 
                                 # Drive items should inherit site access controls only if
@@ -2099,12 +2371,17 @@ class SharepointOnlineDataSource(BaseDataSource):
 
         return self._decorate_with_access_control(drive_item, access_control)
 
-    async def drive_items(self, site_drive, max_drive_item_age):
+    async def drive_items(self, site_drive, max_drive_item_age, site=None):
         async for page in self.client.drive_items(site_drive["id"]):
             for drive_item in page:
                 drive_item["_id"] = drive_item["id"]
                 drive_item["object_type"] = "drive_item"
                 drive_item["_timestamp"] = drive_item["lastModifiedDateTime"]
+
+                # Enrich with metadata
+                drive_item = self._enrich_document_with_metadata(
+                    drive_item, site=site, site_drive=site_drive
+                )
 
                 yield drive_item, self.download_function(drive_item, max_drive_item_age)
 
@@ -2215,10 +2492,20 @@ class SharepointOnlineDataSource(BaseDataSource):
                                 ACCESS_CONTROL, []
                             )
 
+                        # Enrich attachment with metadata before yielding
+                        list_item_attachment = self._enrich_document_with_metadata(
+                            list_item_attachment, site=site, site_list={"id": site_list_id, "name": site_list_name}
+                        )
+
                         attachment_download_func = partial(
                             self.get_attachment_content, list_item_attachment
                         )
                         yield list_item_attachment, attachment_download_func
+
+                # Enrich list item with metadata before yielding
+                list_item = self._enrich_document_with_metadata(
+                    list_item, site=site, site_list={"id": site_list_id, "name": site_list_name}
+                )
 
                 yield list_item, None
 
@@ -2271,6 +2558,11 @@ class SharepointOnlineDataSource(BaseDataSource):
                     site_list = self._decorate_with_access_control(
                         site_list, site_access_control
                     )
+
+                # Enrich site list with metadata before yielding
+                site_list = self._enrich_document_with_metadata(
+                    site_list, site=site, site_list=site_list
+                )
 
                 yield site_list
 
@@ -2406,6 +2698,11 @@ class SharepointOnlineDataSource(BaseDataSource):
                 ]:
                     if html_field in site_page:
                         site_page[html_field] = html_to_text(site_page[html_field])
+
+                # Enrich site page with metadata before yielding
+                site_page = self._enrich_document_with_metadata(
+                    site_page, site=site
+                )
 
                 yield site_page
 
