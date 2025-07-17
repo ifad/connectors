@@ -74,7 +74,11 @@ DEFAULT_BACKOFF_MULTIPLIER = 5
 FILE_WRITE_CHUNK_SIZE = 1024 * 64  # 64KB default SSD page size
 MAX_DOCUMENT_SIZE = 10485760
 WILDCARD = "*"
+# Base fields for all drive items
 DRIVE_ITEMS_FIELDS = "id,content.downloadUrl,lastModifiedDateTime,lastModifiedBy,root,deleted,file,folder,package,name,webUrl,createdBy,createdDateTime,size,parentReference"
+
+# Additional ODC-specific managed properties
+ODC_MANAGED_PROPERTIES = "ActivityID,BusinessUnit,OPDCategory,LOB,Division,DocumentType,FinancialYear,Quarter,Month,Owner,Reviewer,Approver,Status,Priority,Confidentiality,Retention,Compliance,RelatedProjects,Tags,Keywords,Notes"
 
 CURSOR_SITE_DRIVE_KEY = "site_drives"
 
@@ -885,10 +889,17 @@ class SharepointOnlineClient:
             if "value" in response and len(response["value"]) > 0:
                 yield DriveItemsPage(response["value"], delta_link)
 
-    async def drive_items(self, drive_id, url=None):
+    async def drive_items(self, drive_id, url=None, site=None):
+        # Build field list with conditional ODC properties
+        fields = DRIVE_ITEMS_FIELDS
+        
+        # Add ODC managed properties if this is an ODC site
+        if site and self._is_odc_site(site):
+            fields = f"{DRIVE_ITEMS_FIELDS},{ODC_MANAGED_PROPERTIES}"
+        
         url = (
             (
-                f"{GRAPH_API_URL}/drives/{drive_id}/root/delta?$select={DRIVE_ITEMS_FIELDS}"
+                f"{GRAPH_API_URL}/drives/{drive_id}/root/delta?$select={fields}"
             )
             if not url
             else url
@@ -896,6 +907,19 @@ class SharepointOnlineClient:
 
         async for page in self.drive_items_delta(url):
             yield page
+
+    def _is_odc_site(self, site):
+        """Check if site is an ODC (Office Development Center) site based on URL or name patterns."""
+        if not site:
+            return False
+            
+        web_url = site.get("webUrl", "").lower()
+        site_name = site.get("name", "").lower()
+        
+        # Check for ODC indicators in URL or site name
+        odc_indicators = ["odc", "office-development", "dev-center", "development-center"]
+        
+        return any(indicator in web_url or indicator in site_name for indicator in odc_indicators)
 
     async def drive_items_permissions_batch(self, drive_id, drive_item_ids):
         requests = []
@@ -1501,6 +1525,39 @@ class SharepointOnlineDataSource(BaseDataSource):
                 site_url = site["webUrl"].lower()
                 if "odc" in site_url:
                     metadata["Category"] = "ODC"
+
+                    # Business Unit / Division
+                    metadata["Division"] = fields.get("BusinessUnit")
+                    metadata["Department"] = fields.get("BusinessUnit")  # Using same field as Department
+                    
+                    # Document Type
+                    metadata["Content-Type"] = fields.get("DocumentType") or self._determine_content_type(document)
+                    
+                    # Activity and Project information
+                    metadata["ActivityID"] = fields.get("ActivityID")
+                    metadata["ActivityName"] = fields.get("ActivityName")
+                    metadata["ProjectID"] = fields.get("ProjectID")
+                    metadata["ProjectType"] = fields.get("ProjectType")
+                    
+                    # Geographic and temporal metadata
+                    metadata["Region"] = fields.get("Region")
+                    metadata["FocusCountry"] = fields.get("FocusCountry")
+                    metadata["Year"] = fields.get("Year")
+                    metadata["Phase"] = fields.get("Phase")
+                    
+                    # Status and classification
+                    metadata["Status"] = fields.get("OPDStatus")
+                    metadata["GrantType"] = fields.get("GrantType")
+                    metadata["GrantWindow"] = fields.get("GrantWindow")
+                    
+                    # Boolean flags
+                    metadata["Disclosable"] = fields.get("Disclosable")
+                    metadata["NonIFAD"] = fields.get("NonIfad")
+                    metadata["PLF"] = fields.get("PLF")
+                    
+                    # System information
+                    metadata["SystemSource"] = fields.get("ODCIntegration_SystemSource")
+        
                 elif "xdesk" in site_url:
                     metadata["Category"] = "Xdesk"
                 else:
@@ -1508,38 +1565,7 @@ class SharepointOnlineDataSource(BaseDataSource):
             else:
                 metadata["Category"] = None
         
-        # Business Unit / Division
-        metadata["Division"] = fields.get("BusinessUnit")
-        metadata["Department"] = fields.get("BusinessUnit")  # Using same field as Department
-        
-        # Document Type
-        metadata["Content-Type"] = fields.get("DocumentType") or self._determine_content_type(document)
-        
-        # Activity and Project information
-        metadata["ActivityID"] = fields.get("ActivityID")
-        metadata["ActivityName"] = fields.get("ActivityName")
-        metadata["ProjectID"] = fields.get("ProjectID")
-        metadata["ProjectType"] = fields.get("ProjectType")
-        
-        # Geographic and temporal metadata
-        metadata["Region"] = fields.get("Region")
-        metadata["FocusCountry"] = fields.get("FocusCountry")
-        metadata["Year"] = fields.get("Year")
-        metadata["Phase"] = fields.get("Phase")
-        
-        # Status and classification
-        metadata["Status"] = fields.get("OPDStatus")
-        metadata["GrantType"] = fields.get("GrantType")
-        metadata["GrantWindow"] = fields.get("GrantWindow")
-        
-        # Boolean flags
-        metadata["Disclosable"] = fields.get("Disclosable")
-        metadata["NonIFAD"] = fields.get("NonIfad")
-        metadata["PLF"] = fields.get("PLF")
-        
-        # System information
-        metadata["SystemSource"] = fields.get("ODCIntegration_SystemSource")
-        
+  
         return metadata
 
     def _determine_content_type(self, document):
@@ -2025,7 +2051,7 @@ class SharepointOnlineDataSource(BaseDataSource):
                         None,
                     )
 
-                    async for page in self.client.drive_items(site_drive["id"]):
+                    async for page in self.client.drive_items(site_drive["id"], site=site):
                         for drive_items_batch in iterable_batches_generator(
                             page.items, SPO_API_MAX_BATCH_SIZE
                         ):
@@ -2153,7 +2179,7 @@ class SharepointOnlineDataSource(BaseDataSource):
                     delta_link = self.get_drive_delta_link(site_drive["id"])
 
                     async for page in self.client.drive_items(
-                        drive_id=site_drive["id"], url=delta_link
+                        drive_id=site_drive["id"], url=delta_link, site=site
                     ):
                         for drive_items_batch in iterable_batches_generator(
                             page.items, SPO_API_MAX_BATCH_SIZE
@@ -2372,7 +2398,7 @@ class SharepointOnlineDataSource(BaseDataSource):
         return self._decorate_with_access_control(drive_item, access_control)
 
     async def drive_items(self, site_drive, max_drive_item_age, site=None):
-        async for page in self.client.drive_items(site_drive["id"]):
+        async for page in self.client.drive_items(site_drive["id"], site=site):
             for drive_item in page:
                 drive_item["_id"] = drive_item["id"]
                 drive_item["object_type"] = "drive_item"
