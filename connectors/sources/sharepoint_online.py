@@ -33,6 +33,7 @@ from connectors.filtering.validation import (
 )
 from connectors.logger import logger
 from connectors.source import CURSOR_SYNC_TIMESTAMP, BaseDataSource
+from connectors.sources.sharepoint_metadata_enricher import SharePointMetadataEnricher
 from connectors.utils import (
     TIKA_SUPPORTED_FILETYPES,
     CacheWithTimeout,
@@ -1260,9 +1261,18 @@ class SharepointOnlineDataSource(BaseDataSource):
 
         self._client = None
         self.site_group_cache = {}
+        self._metadata_enricher = None
 
     def _set_internal_logger(self):
         self.client.set_logger(self._logger)
+        # Initialize metadata enricher with logger
+        self._metadata_enricher = SharePointMetadataEnricher(logger=self._logger)
+
+    @property
+    def metadata_enricher(self):
+        if not self._metadata_enricher:
+            self._metadata_enricher = SharePointMetadataEnricher(logger=self._logger)
+        return self._metadata_enricher
 
     @property
     def client(self):
@@ -1495,210 +1505,9 @@ class SharepointOnlineDataSource(BaseDataSource):
 
         return document
 
-    def _extract_metadata_from_sharepoint_fields(self, document, site=None, site_drive=None, site_list=None):
-        """
-        Extract metadata from SharePoint fields and map them to standardized metadata structure.
-        
-        Args:
-            document: The SharePoint document/item
-            site: Site information (optional)
-            site_drive: Drive information (optional) 
-            site_list: List information (optional)
-            
-        Returns:
-            dict: Extracted metadata as key-value pairs
-        """
-        metadata = {}
-        
-
-        fields = document.get("fields", {})
-        
-        # Map SharePoint managed properties to your metadata structure
-        # Based on your SEARCH Managed properties table
-        # Category mapping
-        odc_category = fields.get("OPDCategory") or fields.get("ODCCategory")
-        if odc_category:
-            metadata["Category"] = odc_category
-        else:
-            # Try to determine category from site URL or other indicators
-            if site and site.get("webUrl"):
-                site_url = site["webUrl"].lower()
-                if "odc" in site_url:
-                    metadata["Category"] = "ODC"
-
-                    # Business Unit / Division
-                    metadata["Division"] = fields.get("BusinessUnit")
-                    metadata["Department"] = fields.get("BusinessUnit")  # Using same field as Department
-                    
-                    # Document Type
-                    metadata["Content-Type"] = fields.get("DocumentType") or self._determine_content_type(document)
-                    
-                    # Activity and Project information
-                    metadata["ActivityID"] = fields.get("ActivityID")
-                    metadata["ActivityName"] = fields.get("ActivityName")
-                    metadata["ProjectID"] = fields.get("ProjectID")
-                    metadata["ProjectType"] = fields.get("ProjectType")
-                    
-                    # Geographic and temporal metadata
-                    metadata["Region"] = fields.get("Region")
-                    metadata["FocusCountry"] = fields.get("FocusCountry")
-                    metadata["Year"] = fields.get("Year")
-                    metadata["Phase"] = fields.get("Phase")
-                    
-                    # Status and classification
-                    metadata["Status"] = fields.get("OPDStatus")
-                    metadata["GrantType"] = fields.get("GrantType")
-                    metadata["GrantWindow"] = fields.get("GrantWindow")
-                    
-                    # Boolean flags
-                    metadata["Disclosable"] = fields.get("Disclosable")
-                    metadata["NonIFAD"] = fields.get("NonIfad")
-                    metadata["PLF"] = fields.get("PLF")
-                    
-                    # System information
-                    metadata["SystemSource"] = fields.get("ODCIntegration_SystemSource")
-        
-                elif "xdesk" in site_url:
-                    metadata["Category"] = "Xdesk"
-                else:
-                    metadata["Category"] = None
-            else:
-                metadata["Category"] = None
-        
-  
-        return metadata
-
-    def _determine_content_type(self, document):
-        """
-        Determine content type based on document properties.
-        
-        Args:
-            document: The SharePoint document
-            
-        Returns:
-            str: Content type classification
-        """
-        object_type = document.get("object_type", "")
-        
-        if object_type == "drive_item":
-            name = document.get("name", "")
-            if "folder" in document:
-                return "Folder"
-            elif name:
-                ext = os.path.splitext(name)[-1].lower()
-                if ext in ['.ppt', '.pptx']:
-                    return "Presentation"
-                elif ext in ['.doc', '.docx', '.pdf']:
-                    return "Document"
-                elif ext in ['.xls', '.xlsx']:
-                    return "Spreadsheet"
-                elif ext in ['.mp4', '.avi', '.mov']:
-                    return "Video"
-                elif ext in ['.jpg', '.jpeg', '.png', '.gif']:
-                    return "Image"
-                else:
-                    return "Document"
-        elif object_type == "site_page":
-            return "Web Page"
-        elif object_type == "list_item":
-            return "List Item"
-        elif object_type == "list_item_attachment":
-            return "Attachment"
-        else:
-            return "Document"
-
-    def _build_metadata_array(self, document, site=None, site_drive=None, site_list=None):
-        """
-        Build metadata array as key-value pairs for the document.
-        
-        Args:
-            document: The SharePoint document
-            site: Site context
-            site_drive: Drive context  
-            site_list: List context
-            
-        Returns:
-            list: Array of metadata key-value pairs
-        """
-        metadata_pairs = []
-        
-        # Extract SharePoint-specific metadata
-        sharepoint_metadata = self._extract_metadata_from_sharepoint_fields(
-            document, site, site_drive, site_list
-        )
-        
-        # Standard metadata that should always be present
-        
-        # Site Name
-        site_name = None
-        if site:
-            site_name = site.get("displayName") or site.get("name") or site.get("title")
-        metadata_pairs.append({"key": "Site Name", "value": site_name})
-        
-        # Document Library / Drive Name
-        library_name = None
-        if site_drive:
-            library_name = site_drive.get("name") or site_drive.get("displayName")
-        elif site_list:
-            library_name = site_list.get("name") or site_list.get("displayName")
-        metadata_pairs.append({"key": "Document Library", "value": library_name})
-        
-        # File Type/Extension
-        file_extension = None
-        file_name = document.get("name") or document.get("_original_filename") or document.get("FileName", "")
-        if file_name and "." in file_name:
-            file_extension = os.path.splitext(file_name)[-1].lower()
-        metadata_pairs.append({"key": "File Type", "value": file_extension})
-        
-        # File Path/Location
-        file_path = None
-        if document.get("webUrl"):
-            file_path = document["webUrl"]
-        elif document.get("parentReference", {}).get("path"):
-            file_path = document["parentReference"]["path"]
-        elif site and site.get("webUrl"):
-            # Construct path from site URL and document name
-            site_path = self._site_path_from_web_url(site["webUrl"])
-            if file_name:
-                file_path = f"{site_path}/{file_name}"
-            else:
-                file_path = site_path
-        metadata_pairs.append({"key": "File Path", "value": file_path})
-        
-        # Add all SharePoint metadata fields
-        for key, value in sharepoint_metadata.items():
-            metadata_pairs.append({"key": key, "value": value})
-        
-        # Additional technical metadata
-        metadata_pairs.append({"key": "Object Type", "value": document.get("object_type")})
-        metadata_pairs.append({"key": "Document ID", "value": document.get("_id")})
-        metadata_pairs.append({"key": "Last Modified", "value": document.get("_timestamp") or document.get("lastModifiedDateTime")})
-        
-        # Size information for files
-        if document.get("size"):
-            metadata_pairs.append({"key": "File Size", "value": document.get("size")})
-        
-        # Creator information
-        created_by = None
-        if document.get("createdBy", {}).get("user", {}).get("displayName"):
-            created_by = document["createdBy"]["user"]["displayName"]
-        elif document.get("createdBy", {}).get("user", {}).get("email"):
-            created_by = document["createdBy"]["user"]["email"]
-        metadata_pairs.append({"key": "Created By", "value": created_by})
-        
-        # Modified by information  
-        modified_by = None
-        if document.get("lastModifiedBy", {}).get("user", {}).get("displayName"):
-            modified_by = document["lastModifiedBy"]["user"]["displayName"]
-        elif document.get("lastModifiedBy", {}).get("user", {}).get("email"):
-            modified_by = document["lastModifiedBy"]["user"]["email"]
-        metadata_pairs.append({"key": "Modified By", "value": modified_by})
-        
-        return metadata_pairs
-
     def _enrich_document_with_metadata(self, document, site=None, site_drive=None, site_list=None):
         """
-        Enrich document with metadata array.
+        Enrich document with metadata using the dedicated metadata enricher.
         
         Args:
             document: The document to enrich
@@ -1709,22 +1518,14 @@ class SharepointOnlineDataSource(BaseDataSource):
         Returns:
             dict: Document enriched with metadata
         """
-        # Check if metadata enrichment is enabled
-        if not self.configuration.get("enrich_metadata", True):
-            return document
-            
-        try:
-            metadata_array = self._build_metadata_array(document, site, site_drive, site_list)
-            document["metadata"] = metadata_array
-            
-            self._logger.debug(f"Enriched document {document.get('_id')} with {len(metadata_array)} metadata pairs")
-            
-        except Exception as e:
-            self._logger.warning(f"Failed to enrich document {document.get('_id')} with metadata: {str(e)}")
-            # Ensure at least an empty metadata array
-            document["metadata"] = []
-        
-        return document
+        enrich_enabled = bool(self.configuration.get("enrich_metadata", True))
+        return self.metadata_enricher.enrich_document_with_metadata(
+            document=document,
+            site=site,
+            site_drive=site_drive,
+            site_list=site_list,
+            enrich_metadata_enabled=enrich_enabled
+        )
 
     async def _site_access_control(self, site):
         """Fetches all permissions for all owners, members and visitors of a given site.
