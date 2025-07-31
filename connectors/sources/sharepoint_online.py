@@ -78,9 +78,6 @@ WILDCARD = "*"
 # Base fields for all drive items
 DRIVE_ITEMS_FIELDS = "id,content.downloadUrl,lastModifiedDateTime,lastModifiedBy,root,deleted,file,folder,package,name,webUrl,createdBy,createdDateTime,size,parentReference"
 
-# Additional ODC-specific managed properties
-ODC_MANAGED_PROPERTIES = "ActivityID,BusinessUnit,OPDCategory,LOB,Division,DocumentType,FinancialYear,Quarter,Month,Owner,Reviewer,Approver,Status,Priority,Confidentiality,Retention,Compliance,RelatedProjects,Tags,Keywords,Notes"
-
 CURSOR_SITE_DRIVE_KEY = "site_drives"
 
 # Microsoft Graph API Delta constants
@@ -890,13 +887,21 @@ class SharepointOnlineClient:
             if "value" in response and len(response["value"]) > 0:
                 yield DriveItemsPage(response["value"], delta_link)
 
-    async def drive_items(self, drive_id, url=None, site=None):
+    async def drive_items(self, drive_id, url=None, site=None, metadata_enricher=None):
         # Build field list with conditional ODC properties
         fields = DRIVE_ITEMS_FIELDS
         
         # Add ODC managed properties if this is an ODC site
-        if site and self._is_odc_site(site):
-            fields = f"{DRIVE_ITEMS_FIELDS},{ODC_MANAGED_PROPERTIES}"
+        # Use metadata enricher's ODC detection if available, otherwise fall back to local method
+        is_odc = False
+        if metadata_enricher and hasattr(metadata_enricher, 'should_include_odc_properties'):
+            is_odc = metadata_enricher.should_include_odc_properties(site)
+        elif site:
+            is_odc = self._is_odc_site(site)
+            
+        if is_odc and metadata_enricher:
+            odc_properties = metadata_enricher.get_odc_managed_properties()
+            fields = f"{DRIVE_ITEMS_FIELDS},{odc_properties}"
         
         url = (
             (
@@ -1265,13 +1270,19 @@ class SharepointOnlineDataSource(BaseDataSource):
 
     def _set_internal_logger(self):
         self.client.set_logger(self._logger)
-        # Initialize metadata enricher with logger
-        self._metadata_enricher = SharePointMetadataEnricher(logger=self._logger)
+        # Initialize metadata enricher with logger and graph api client
+        self._metadata_enricher = SharePointMetadataEnricher(
+            logger=self._logger, 
+            graph_api_client=self.client._graph_api_client
+        )
 
     @property
     def metadata_enricher(self):
         if not self._metadata_enricher:
-            self._metadata_enricher = SharePointMetadataEnricher(logger=self._logger)
+            self._metadata_enricher = SharePointMetadataEnricher(
+                logger=self._logger, 
+                graph_api_client=self.client._graph_api_client
+            )
         return self._metadata_enricher
 
     @property
@@ -1852,7 +1863,7 @@ class SharepointOnlineDataSource(BaseDataSource):
                         None,
                     )
 
-                    async for page in self.client.drive_items(site_drive["id"], site=site):
+                    async for page in self.client.drive_items(site_drive["id"], site=site, metadata_enricher=self.metadata_enricher):
                         for drive_items_batch in iterable_batches_generator(
                             page.items, SPO_API_MAX_BATCH_SIZE
                         ):
@@ -1866,6 +1877,12 @@ class SharepointOnlineDataSource(BaseDataSource):
                                 drive_item["_timestamp"] = drive_item.get(
                                     "lastModifiedDateTime"
                                 )
+
+                                # HYBRID APPROACH: Enrich drive item with SharePoint list metadata using listItem/fields
+                                if self.configuration.get("enrich_metadata", True):
+                                    drive_item = await self.metadata_enricher.enrich_drive_item_with_list_metadata(
+                                        drive_item, site["id"]
+                                    )
 
                                 # Enrich with metadata
                                 drive_item = self._enrich_document_with_metadata(
@@ -1980,7 +1997,7 @@ class SharepointOnlineDataSource(BaseDataSource):
                     delta_link = self.get_drive_delta_link(site_drive["id"])
 
                     async for page in self.client.drive_items(
-                        drive_id=site_drive["id"], url=delta_link, site=site
+                        drive_id=site_drive["id"], url=delta_link, site=site, metadata_enricher=self.metadata_enricher
                     ):
                         for drive_items_batch in iterable_batches_generator(
                             page.items, SPO_API_MAX_BATCH_SIZE
@@ -1995,6 +2012,12 @@ class SharepointOnlineDataSource(BaseDataSource):
                                 drive_item["_timestamp"] = drive_item.get(
                                     "lastModifiedDateTime"
                                 )
+
+                                # HYBRID APPROACH: Enrich drive item with SharePoint list metadata using listItem/fields
+                                if self.configuration.get("enrich_metadata", True):
+                                    drive_item = await self.metadata_enricher.enrich_drive_item_with_list_metadata(
+                                        drive_item, site["id"]
+                                    )
 
                                 # Enrich with metadata
                                 drive_item = self._enrich_document_with_metadata(
@@ -2199,7 +2222,7 @@ class SharepointOnlineDataSource(BaseDataSource):
         return self._decorate_with_access_control(drive_item, access_control)
 
     async def drive_items(self, site_drive, max_drive_item_age, site=None):
-        async for page in self.client.drive_items(site_drive["id"], site=site):
+        async for page in self.client.drive_items(site_drive["id"], site=site, metadata_enricher=self.metadata_enricher):
             for drive_item in page:
                 drive_item["_id"] = drive_item["id"]
                 drive_item["object_type"] = "drive_item"
