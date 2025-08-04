@@ -2,7 +2,8 @@ import os
 from typing import Dict, List, Optional, Any
 
 # ODC-specific managed properties for SharePoint Graph API calls
-ODC_MANAGED_PROPERTIES = "ActivityID,BusinessUnit,OPDCategory,LOB,Division,DocumentType,FinancialYear,Quarter,Month,Owner,Reviewer,Approver,Status,Priority,Confidentiality,Retention,Compliance,RelatedProjects,Tags,Keywords,Notes"
+# Includes both ODC and ODP (Operations Document Portal) fields
+ODC_MANAGED_PROPERTIES = "ActivityID,BusinessUnit,OPDCategory,LOB,Division,DocumentType,FinancialYear,Quarter,Month,Owner,Reviewer,Approver,Status,Priority,Confidentiality,Retention,Compliance,RelatedProjects,Tags,Keywords,Notes,ProjectID,ProjectName,ProjectTitle,ProjectType,ProjectSector,Phase,Region,Country,FocusCountry,GrantType,GrantWindow,GrantRecipient,Theme,ShortName,AllDocuments,Disclosable,Disclosed,NonIFAD,PLF,Sensitive,BorrowerID,CopyValidation,DocumentTypeID,ODCIntegration_CIMission"
 
 # Graph API URL constant
 GRAPH_API_URL = "https://graph.microsoft.com/v1.0"
@@ -35,7 +36,7 @@ class SharePointMetadataEnricher:
         
         # Official ODC site URLs
         odc_sites = [
-            "aprop/",
+            "aprop",
             "lacop",
             "esaop",
             "nenop",
@@ -161,6 +162,28 @@ class SharePointMetadataEnricher:
         metadata = {}
         fields = document.get("fields", {})
         
+        # Helper function to extract value from complex SharePoint field structures
+        def extract_field_value(field_data):
+            if isinstance(field_data, dict):
+                # Handle managed metadata fields with Label/TermGuid structure
+                if "Label" in field_data:
+                    return field_data["Label"]
+                # Handle lookup fields or other object structures
+                elif "DisplayName" in field_data:
+                    return field_data["DisplayName"]
+                elif "Value" in field_data:
+                    return field_data["Value"]
+            elif isinstance(field_data, list):
+                # Handle arrays of managed metadata or lookup fields
+                if field_data and isinstance(field_data[0], dict):
+                    return [extract_field_value(item) for item in field_data]
+                else:
+                    return field_data
+            else:
+                # Handle simple string/number/boolean values
+                return field_data
+            return None
+        
         # Determine category from site URL using ODC site detection
         if site and site.get("webUrl"):
             if self._is_odc_site(site):
@@ -174,37 +197,78 @@ class SharePointMetadataEnricher:
         else:
             metadata["Category"] = None
 
+        # Core business metadata
         metadata["Division"] = fields.get("BusinessUnit")
         metadata["Department"] = fields.get("BusinessUnit") 
-        metadata["Content-Type"] = fields.get("DocumentType") or self._determine_content_type(document)
         
-        # Activity and Project information
-        metadata["ActivityID"] = fields.get("ActivityID")
-        metadata["ActivityName"] = fields.get("ActivityName")
-        metadata["ProjectID"] = fields.get("ProjectID")
+        # Document type - handle both simple and complex field structures
+        doc_type = extract_field_value(fields.get("DocumentType"))
+        metadata["Content-Type"] = doc_type or self._determine_content_type(document)
+        
+        # Project information - handle complex field structures
+        project_id = extract_field_value(fields.get("ProjectID"))
+        if project_id:
+            metadata["ProjectID"] = project_id
+        else:
+            # Fallback to hidden field
+            metadata["ProjectID"] = fields.get("ProjectID_Hidden")
+            
         metadata["ProjectType"] = fields.get("ProjectType")
         metadata["ProjectName"] = fields.get("ProjectName")
         metadata["ProjectTitle"] = fields.get("ProjectTitle")
         metadata["ProjectSector"] = fields.get("ProjectSector")
         
+        # Handle ShortName and AllDocuments (project short names)
+        short_name = extract_field_value(fields.get("ShortName"))
+        all_documents = extract_field_value(fields.get("AllDocuments"))
+        metadata["ShortName"] = short_name
+        metadata["AllDocuments"] = all_documents
+        
         # Geographic and temporal metadata
         metadata["Region"] = fields.get("Region")
-        metadata["FocusCountry"] = fields.get("FocusCountry")
+        metadata["Country"] = fields.get("Country")
+        metadata["CountryID"] = fields.get("CountryID")
+        metadata["FocusCountryIDs"] = fields.get("FocusCountryIDs")
+        
+        # Handle complex FocusCountry field
+        focus_country = extract_field_value(fields.get("FocusCountry"))
+        metadata["FocusCountry"] = focus_country
+        
         metadata["Year"] = fields.get("Year")
         metadata["Phase"] = fields.get("Phase")
+        metadata["PhaseID"] = fields.get("PhaseID")
         
-        # Status and classification
-        metadata["Status"] = fields.get("OPDStatus") or fields.get("Status")
+        # Grant and financing information
         metadata["GrantType"] = fields.get("GrantType")
         metadata["GrantWindow"] = fields.get("GrantWindow")
+        grant_recipient = extract_field_value(fields.get("GrantRecipient"))
+        metadata["GrantRecipient"] = grant_recipient
+        metadata["BorrowerID"] = fields.get("BorrowerID")
         
-        # Boolean flags
+        # Themes and topics
+        themes = extract_field_value(fields.get("Theme"))
+        metadata["Theme"] = themes
+        
+        # Document classification and status
         metadata["Disclosable"] = fields.get("Disclosable")
+        metadata["Disclosed"] = fields.get("Disclosed")
         metadata["NonIFAD"] = fields.get("NonIfad")
         metadata["PLF"] = fields.get("PLF")
+        metadata["Sensitive"] = fields.get("Sensitive")
+        metadata["IsInDocSet"] = fields.get("IsInDocSet")
+        metadata["OPDIsLink"] = fields.get("OPDIsLink")
         
-        # System information
+        # Validation and compliance
+        metadata["CopyValidation"] = fields.get("CopyValidation")
+        metadata["SentToRMS"] = fields.get("SentToRMS")
+        
+        # System and integration fields
+        metadata["ODCIntegration_CIMission"] = fields.get("ODCIntegration_CIMission")
         metadata["SystemSource"] = fields.get("ODCIntegration_SystemSource")
+        metadata["DocumentTypeID"] = fields.get("DocumentTypeID")
+        
+        # Project reference field
+        metadata["Project"] = fields.get("Project")
         
         # Additional common SharePoint fields
         metadata["Title"] = fields.get("Title")
@@ -216,6 +280,26 @@ class SharePointMetadataEnricher:
         metadata["FileDirRef"] = fields.get("FileDirRef")
         metadata["ContentType"] = fields.get("ContentType")
         metadata["FileType"] = fields.get("File_x0020_Type")
+        
+        # Document icon and size
+        metadata["DocIcon"] = fields.get("DocIcon")
+        metadata["FileSizeDisplay"] = fields.get("FileSizeDisplay")
+        
+        # Document ID and linking
+        dlc_doc_id = fields.get("_dlc_DocIdUrl")
+        if isinstance(dlc_doc_id, dict) and "Description" in dlc_doc_id:
+            metadata["DocumentID"] = dlc_doc_id["Description"]
+            metadata["DocumentIDUrl"] = dlc_doc_id.get("Url")
+        
+        # Version information
+        metadata["UIVersionString"] = fields.get("_UIVersionString")
+        
+        # Activity information (for ODC compatibility)
+        metadata["ActivityID"] = fields.get("ActivityID")
+        metadata["ActivityName"] = fields.get("ActivityName")
+        
+        # Legacy status field handling
+        metadata["Status"] = fields.get("OPDStatus") or fields.get("Status")
         
         # Check for any OPD/ODC category fields
         odc_category = fields.get("OPDCategory") or fields.get("ODCCategory")
@@ -337,13 +421,36 @@ class SharePointMetadataEnricher:
             
             # Add all SharePoint metadata fields for all documents
             sharepoint_fields = [
+                # Project and Activity Information
                 "ActivityID", "ActivityName", "ProjectID", "ProjectType",
-                "ProjectName", "ProjectTitle", "ProjectSector",
-                "Region", "FocusCountry", "Year", "Phase", "Status",
-                "GrantType", "GrantWindow", "Disclosable", "NonIFAD", 
-                "PLF", "SystemSource", "Title", "Author", "Editor",
-                "Created", "Modified", "FileLeafRef", "FileDirRef",
-                "ContentType", "FileType"
+                "ProjectName", "ProjectTitle", "ProjectSector", "Project",
+                "ShortName", "AllDocuments",
+                
+                # Geographic and Temporal
+                "Region", "Country", "CountryID", "FocusCountry", "FocusCountryIDs",
+                "Year", "Phase", "PhaseID",
+                
+                # Grant and Financing
+                "GrantType", "GrantWindow", "GrantRecipient", "BorrowerID",
+                
+                # Themes and Classification
+                "Theme", "Status", "DocumentTypeID",
+                
+                # Flags and Status
+                "Disclosable", "Disclosed", "NonIFAD", "PLF", "Sensitive", 
+                "IsInDocSet", "OPDIsLink",
+                
+                # Validation and Compliance
+                "CopyValidation", "SentToRMS",
+                
+                # System and Integration
+                "SystemSource", "ODCIntegration_CIMission",
+                
+                # Standard SharePoint Fields
+                "Title", "Author", "Editor", "Created", "Modified", 
+                "FileLeafRef", "FileDirRef", "ContentType", "FileType",
+                "DocIcon", "FileSizeDisplay", "DocumentID", "DocumentIDUrl",
+                "UIVersionString"
             ]
             
             for field in sharepoint_fields:
