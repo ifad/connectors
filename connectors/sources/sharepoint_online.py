@@ -33,6 +33,7 @@ from connectors.filtering.validation import (
 )
 from connectors.logger import logger
 from connectors.source import CURSOR_SYNC_TIMESTAMP, BaseDataSource
+from connectors.sources.sharepoint_metadata_enricher import SharePointMetadataEnricher
 from connectors.utils import (
     TIKA_SUPPORTED_FILETYPES,
     CacheWithTimeout,
@@ -74,6 +75,7 @@ DEFAULT_BACKOFF_MULTIPLIER = 5
 FILE_WRITE_CHUNK_SIZE = 1024 * 64  # 64KB default SSD page size
 MAX_DOCUMENT_SIZE = 10485760
 WILDCARD = "*"
+# Base fields for all drive items
 DRIVE_ITEMS_FIELDS = "id,content.downloadUrl,lastModifiedDateTime,lastModifiedBy,root,deleted,file,folder,package,name,webUrl,createdBy,createdDateTime,size,parentReference"
 
 CURSOR_SITE_DRIVE_KEY = "site_drives"
@@ -499,6 +501,14 @@ class MicrosoftAPISession:
         try:
             token = await self._api_token.get()
             headers = {"authorization": f"Bearer {token}"}
+
+            # If the absolute_url contains "/sites?expand=sites" then add header prefer: HonorNonIndexedQueriesWarningMayFailRandomly as per Microsoft Support to handle sites with many subsites
+            if "/sites?expand=sites" in absolute_url:
+                headers["prefer"] = "HonorNonIndexedQueriesWarningMayFailRandomly"
+                self._logger.info(
+                    f"Adding header prefer: HonorNonIndexedQueriesWarningMayFailRandomly to request {absolute_url}"
+                )
+
             self._logger.debug(f"Calling Sharepoint Endpoint: {absolute_url}")
 
             async with self._http_session.get(
@@ -877,10 +887,25 @@ class SharepointOnlineClient:
             if "value" in response and len(response["value"]) > 0:
                 yield DriveItemsPage(response["value"], delta_link)
 
-    async def drive_items(self, drive_id, url=None):
+    async def drive_items(self, drive_id, url=None, site=None, metadata_enricher=None):
+        # Build field list with conditional ODC properties
+        fields = DRIVE_ITEMS_FIELDS
+        
+        # Add ODC managed properties if this is an ODC site
+        # Use metadata enricher's ODC detection if available, otherwise fall back to local method
+        is_odc = False
+        if metadata_enricher and hasattr(metadata_enricher, 'should_include_odc_properties'):
+            is_odc = metadata_enricher.should_include_odc_properties(site)
+        elif site:
+            is_odc = self._is_odc_site(site)
+            
+        if is_odc and metadata_enricher:
+            odc_properties = metadata_enricher.get_odc_managed_properties()
+            fields = f"{DRIVE_ITEMS_FIELDS},{odc_properties}"
+        
         url = (
             (
-                f"{GRAPH_API_URL}/drives/{drive_id}/root/delta?$select={DRIVE_ITEMS_FIELDS}"
+                f"{GRAPH_API_URL}/drives/{drive_id}/root/delta?$select={fields}"
             )
             if not url
             else url
@@ -888,6 +913,19 @@ class SharepointOnlineClient:
 
         async for page in self.drive_items_delta(url):
             yield page
+
+    def _is_odc_site(self, site):
+        """Check if site is an ODC (Office Development Center) site based on URL or name patterns."""
+        if not site:
+            return False
+            
+        web_url = site.get("webUrl", "").lower()
+        site_name = site.get("name", "").lower()
+        
+        # Check for ODC indicators in URL or site name
+        odc_indicators = ["odc", "office-development", "dev-center", "development-center"]
+        
+        return any(indicator in web_url or indicator in site_name for indicator in odc_indicators)
 
     async def drive_items_permissions_batch(self, drive_id, drive_item_ids):
         requests = []
@@ -1228,9 +1266,24 @@ class SharepointOnlineDataSource(BaseDataSource):
 
         self._client = None
         self.site_group_cache = {}
+        self._metadata_enricher = None
 
     def _set_internal_logger(self):
         self.client.set_logger(self._logger)
+        # Initialize metadata enricher with logger and graph api client
+        self._metadata_enricher = SharePointMetadataEnricher(
+            logger=self._logger, 
+            graph_api_client=self.client._graph_api_client
+        )
+
+    @property
+    def metadata_enricher(self):
+        if not self._metadata_enricher:
+            self._metadata_enricher = SharePointMetadataEnricher(
+                logger=self._logger, 
+                graph_api_client=self.client._graph_api_client
+            )
+        return self._metadata_enricher
 
     @property
     def client(self):
@@ -1392,6 +1445,15 @@ class SharepointOnlineDataSource(BaseDataSource):
                 "type": "bool",
                 "value": True,
             },
+            "enrich_metadata": {
+                "display": "toggle",
+                "label": "Enrich documents with metadata",
+                "order": 17,
+                "tooltip": "Enable this option to enrich all documents with structured metadata including category, division, content type, and other SharePoint managed properties. The metadata will be stored as an array of key-value pairs in a 'metadata' field.",
+                "type": "bool",
+                "value": True,
+                "ui_restrictions": ["advanced"],
+            },
         }
 
     async def validate_config(self):
@@ -1453,6 +1515,28 @@ class SharepointOnlineDataSource(BaseDataSource):
             )
 
         return document
+
+    def _enrich_document_with_metadata(self, document, site=None, site_drive=None, site_list=None):
+        """
+        Enrich document with metadata using the dedicated metadata enricher.
+        
+        Args:
+            document: The document to enrich
+            site: Site context
+            site_drive: Drive context
+            site_list: List context
+            
+        Returns:
+            dict: Document enriched with metadata
+        """
+        enrich_enabled = bool(self.configuration.get("enrich_metadata", True))
+        return self.metadata_enricher.enrich_document_with_metadata(
+            document=document,
+            site=site,
+            site_drive=site_drive,
+            site_list=site_list,
+            enrich_metadata_enabled=enrich_enabled
+        )
 
     async def _site_access_control(self, site):
         """Fetches all permissions for all owners, members and visitors of a given site.
@@ -1743,6 +1827,8 @@ class SharepointOnlineDataSource(BaseDataSource):
             max_drive_item_age = advanced_rules["skipExtractingDriveItemsOlderThan"]
 
         async for site_collection in self.site_collections():
+            # Enrich site collection with metadata
+            site_collection = self._enrich_document_with_metadata(site_collection)
             yield site_collection, None
 
             async for site in self.sites(
@@ -1754,20 +1840,30 @@ class SharepointOnlineDataSource(BaseDataSource):
                     site_admin_access_control,
                 ) = await self._site_access_control(site)
 
+                # Enrich site with metadata and access control
+                enriched_site = self._enrich_document_with_metadata(site)
+                enriched_site = self._decorate_with_access_control(enriched_site, site_access_control)
+
                 yield (
-                    self._decorate_with_access_control(site, site_access_control),
+                    enriched_site,
                     None,
                 )
 
                 async for site_drive in self.site_drives(site):
+                    # Enrich site drive with metadata and access control
+                    enriched_site_drive = self._enrich_document_with_metadata(
+                        site_drive, site=site, site_drive=site_drive
+                    )
+                    enriched_site_drive = self._decorate_with_access_control(
+                        enriched_site_drive, site_access_control
+                    )
+                    
                     yield (
-                        self._decorate_with_access_control(
-                            site_drive, site_access_control
-                        ),
+                        enriched_site_drive,
                         None,
                     )
 
-                    async for page in self.client.drive_items(site_drive["id"]):
+                    async for page in self.client.drive_items(site_drive["id"], site=site, metadata_enricher=self.metadata_enricher):
                         for drive_items_batch in iterable_batches_generator(
                             page.items, SPO_API_MAX_BATCH_SIZE
                         ):
@@ -1780,6 +1876,17 @@ class SharepointOnlineDataSource(BaseDataSource):
                                 drive_item["object_type"] = "drive_item"
                                 drive_item["_timestamp"] = drive_item.get(
                                     "lastModifiedDateTime"
+                                )
+
+                                # HYBRID APPROACH: Enrich drive item with SharePoint list metadata using listItem/fields
+                                if self.configuration.get("enrich_metadata", True):
+                                    drive_item = await self.metadata_enricher.enrich_drive_item_with_list_metadata(
+                                        drive_item, site["id"]
+                                    )
+
+                                # Enrich with metadata
+                                drive_item = self._enrich_document_with_metadata(
+                                    drive_item, site=site, site_drive=site_drive
                                 )
 
                                 # Drive items should inherit site access controls only if
@@ -1845,6 +1952,8 @@ class SharepointOnlineDataSource(BaseDataSource):
             max_drive_item_age = advanced_rules["skipExtractingDriveItemsOlderThan"]
 
         async for site_collection in self.site_collections():
+            # Enrich site collection with metadata
+            site_collection = self._enrich_document_with_metadata(site_collection)
             yield site_collection, None, OP_INDEX
 
             async for site in self.sites(
@@ -1857,8 +1966,12 @@ class SharepointOnlineDataSource(BaseDataSource):
                     site_admin_access_control,
                 ) = await self._site_access_control(site)
 
+                # Enrich site with metadata and access control
+                enriched_site = self._enrich_document_with_metadata(site)
+                enriched_site = self._decorate_with_access_control(enriched_site, site_access_control)
+
                 yield (
-                    self._decorate_with_access_control(site, site_access_control),
+                    enriched_site,
                     None,
                     OP_INDEX,
                 )
@@ -1867,10 +1980,16 @@ class SharepointOnlineDataSource(BaseDataSource):
                 # lastModifiedDateTime of the parent site_drive. Therefore, we
                 # set check_timestamp to False when iterating over site_drives.
                 async for site_drive in self.site_drives(site, check_timestamp=False):
+                    # Enrich site drive with metadata and access control
+                    enriched_site_drive = self._enrich_document_with_metadata(
+                        site_drive, site=site, site_drive=site_drive
+                    )
+                    enriched_site_drive = self._decorate_with_access_control(
+                        enriched_site_drive, site_access_control
+                    )
+                    
                     yield (
-                        self._decorate_with_access_control(
-                            site_drive, site_access_control
-                        ),
+                        enriched_site_drive,
                         None,
                         OP_INDEX,
                     )
@@ -1878,7 +1997,7 @@ class SharepointOnlineDataSource(BaseDataSource):
                     delta_link = self.get_drive_delta_link(site_drive["id"])
 
                     async for page in self.client.drive_items(
-                        drive_id=site_drive["id"], url=delta_link
+                        drive_id=site_drive["id"], url=delta_link, site=site, metadata_enricher=self.metadata_enricher
                     ):
                         for drive_items_batch in iterable_batches_generator(
                             page.items, SPO_API_MAX_BATCH_SIZE
@@ -1892,6 +2011,17 @@ class SharepointOnlineDataSource(BaseDataSource):
                                 drive_item["object_type"] = "drive_item"
                                 drive_item["_timestamp"] = drive_item.get(
                                     "lastModifiedDateTime"
+                                )
+
+                                # HYBRID APPROACH: Enrich drive item with SharePoint list metadata using listItem/fields
+                                if self.configuration.get("enrich_metadata", True):
+                                    drive_item = await self.metadata_enricher.enrich_drive_item_with_list_metadata(
+                                        drive_item, site["id"]
+                                    )
+
+                                # Enrich with metadata
+                                drive_item = self._enrich_document_with_metadata(
+                                    drive_item, site=site, site_drive=site_drive
                                 )
 
                                 # Drive items should inherit site access controls only if
@@ -2091,12 +2221,17 @@ class SharepointOnlineDataSource(BaseDataSource):
 
         return self._decorate_with_access_control(drive_item, access_control)
 
-    async def drive_items(self, site_drive, max_drive_item_age):
-        async for page in self.client.drive_items(site_drive["id"]):
+    async def drive_items(self, site_drive, max_drive_item_age, site=None):
+        async for page in self.client.drive_items(site_drive["id"], site=site, metadata_enricher=self.metadata_enricher):
             for drive_item in page:
                 drive_item["_id"] = drive_item["id"]
                 drive_item["object_type"] = "drive_item"
                 drive_item["_timestamp"] = drive_item["lastModifiedDateTime"]
+
+                # Enrich with metadata
+                drive_item = self._enrich_document_with_metadata(
+                    drive_item, site=site, site_drive=site_drive
+                )
 
                 yield drive_item, self.download_function(drive_item, max_drive_item_age)
 
@@ -2207,10 +2342,20 @@ class SharepointOnlineDataSource(BaseDataSource):
                                 ACCESS_CONTROL, []
                             )
 
+                        # Enrich attachment with metadata before yielding
+                        list_item_attachment = self._enrich_document_with_metadata(
+                            list_item_attachment, site=site, site_list={"id": site_list_id, "name": site_list_name}
+                        )
+
                         attachment_download_func = partial(
                             self.get_attachment_content, list_item_attachment
                         )
                         yield list_item_attachment, attachment_download_func
+
+                # Enrich list item with metadata before yielding
+                list_item = self._enrich_document_with_metadata(
+                    list_item, site=site, site_list={"id": site_list_id, "name": site_list_name}
+                )
 
                 yield list_item, None
 
@@ -2263,6 +2408,11 @@ class SharepointOnlineDataSource(BaseDataSource):
                     site_list = self._decorate_with_access_control(
                         site_list, site_access_control
                     )
+
+                # Enrich site list with metadata before yielding
+                site_list = self._enrich_document_with_metadata(
+                    site_list, site=site, site_list=site_list
+                )
 
                 yield site_list
 
@@ -2398,6 +2548,11 @@ class SharepointOnlineDataSource(BaseDataSource):
                 ]:
                     if html_field in site_page:
                         site_page[html_field] = html_to_text(site_page[html_field])
+
+                # Enrich site page with metadata before yielding
+                site_page = self._enrich_document_with_metadata(
+                    site_page, site=site
+                )
 
                 yield site_page
 
@@ -2628,8 +2783,16 @@ class SharepointOnlineDataSource(BaseDataSource):
         a reference to a group's owners, or an individual, and will act accordingly.
         :param member: The dict representing a generic SPO entity. May be a group or an individual
         :return: the access control list (ACL) for this "member"
+
+        Detect when a member has the login name: c:0-.f|rolemanager|spo-grid-all-users. 
+        Map it to a standard identifier in _allow_access_control
         """
         login_name = member.get("LoginName")
+
+        # Handle "Everyone Except External Users" group
+        if login_name and login_name.startswith("c:0-.f|rolemanager|spo-grid-all-users"):
+            self._logger.debug(f"Detected 'Everyone Except External Users' group: '{member.get('Title')}'.")
+            return ["group:EveryoneExceptExternalUsers"]
 
         # 'LoginName' looking like a group indicates a group
         is_group = (
