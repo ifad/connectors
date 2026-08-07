@@ -277,9 +277,10 @@ class EntraAPIToken(MicrosoftSecurityToken):
             self._tenant_id, self._client_id, certificate_data=secrets_concat.encode()
         )
 
-        token = await credentials.get_token(self._scope)
-
-        await credentials.close()
+        try:
+            token = await credentials.get_token(self._scope)
+        finally:
+            await credentials.close()
 
         return token.token, datetime.utcfromtimestamp(token.expires_on)
 

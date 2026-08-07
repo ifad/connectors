@@ -589,6 +589,24 @@ class TestEntraAPIToken:
         assert actual_token == bearer
         assert actual_expires_at == datetime.utcfromtimestamp(expires_at)
 
+    @pytest.mark.asyncio
+    async def test_fetch_token_closes_credentials_when_get_token_fails(
+        self, token, mock_responses, patch_sleep
+    ):
+        certificate_credential_mock = AsyncMock()
+        certificate_credential_mock.get_token = AsyncMock(side_effect=Exception)
+        certificate_credential_mock.close = AsyncMock()
+
+        with patch(
+            "connectors.sources.sharepoint.sharepoint_online.client.CertificateCredential",
+            return_value=certificate_credential_mock,
+        ):
+            with pytest.raises(Exception):
+                await token._fetch_token()
+
+        # One close per attempt, otherwise the underlying aiohttp session leaks
+        assert certificate_credential_mock.close.await_count == 3
+
 
 class TestMicrosoftAPISession:
     class StubAPIToken:
