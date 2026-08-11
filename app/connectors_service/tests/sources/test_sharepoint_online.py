@@ -38,6 +38,7 @@ from connectors.sources.sharepoint.sharepoint_online.client import (
     MicrosoftSecurityToken,
     NotFound,
     PermissionsMissing,
+    ResourceGone,
     SharepointRestAPIToken,
     ThrottledError,
     TokenFetchFailed,
@@ -950,6 +951,29 @@ class TestMicrosoftAPISession:
         assert e is not None
 
     @pytest.mark.asyncio
+    async def test_call_api_with_410_is_not_retried(
+        self,
+        microsoft_api_session,
+        mock_responses,
+        patch_sleep,
+        patch_cancellable_sleeps,
+    ):
+        url = "http://localhost:1234/drives/1/root/delta?token=expired"
+        payload = {"hello": "world"}
+
+        gone_error = ClientResponseError(None, None)
+        gone_error.status = 410
+        gone_error.message = "Gone"
+
+        mock_responses.get(url, exception=gone_error)
+        # Would be served if the call was retried - it must not be
+        mock_responses.get(url, payload=payload)
+
+        with pytest.raises(ResourceGone):
+            async with microsoft_api_session._get(url) as _:
+                pass
+
+    @pytest.mark.asyncio
     async def test_call_api_with_400_without_retry_after_header(
         self,
         microsoft_api_session,
@@ -1357,6 +1381,75 @@ class TestSharepointOnlineClient:
 
         assert len(returned_items) == len(items_page_1) + len(items_page_2)
         assert returned_items == items_page_1 + items_page_2
+
+    @pytest.mark.asyncio
+    async def test_drive_items_with_expired_delta_token_resumes_from_timestamp(
+        self, client, patch_fetch
+    ):
+        drive_id = "12345"
+        expired_delta_link = "https://sharepoint.com/delta-link-lalal?token=expired"
+        fresh_delta_link = "https://sharepoint.com/delta-link-lalal?token=fresh"
+        items = ["1", "2"]
+
+        requested_urls = []
+
+        async def drive_items_delta(url):
+            requested_urls.append(url)
+            if url == expired_delta_link:
+                raise ResourceGone()
+            yield DriveItemsPage(items, fresh_delta_link)
+
+        returned_items = []
+        with patch.object(client, "drive_items_delta", drive_items_delta):
+            async for page in client.drive_items(
+                drive_id, url=expired_delta_link, resume_from="2026-07-01T00:00:00Z"
+            ):
+                returned_items.extend(page)
+                assert page.delta_link() == fresh_delta_link
+
+        assert returned_items == items
+        # The timestamp replaces the dead token, and its colons are URL encoded
+        assert "&token=2026-07-01T00%3A00%3A00Z" in requested_urls[1]
+
+    @pytest.mark.asyncio
+    async def test_drive_items_with_expired_delta_token_and_unusable_timestamp(
+        self, client, patch_fetch
+    ):
+        drive_id = "12345"
+        expired_delta_link = "https://sharepoint.com/delta-link-lalal?token=expired"
+        items = ["1", "2"]
+
+        requested_urls = []
+
+        async def drive_items_delta(url):
+            requested_urls.append(url)
+            if "token=" in url:
+                raise ResourceGone()
+            yield DriveItemsPage(items, "https://sharepoint.com/delta-link-lalal/fresh")
+
+        returned_items = []
+        with patch.object(client, "drive_items_delta", drive_items_delta):
+            async for page in client.drive_items(
+                drive_id, url=expired_delta_link, resume_from="2026-07-01T00:00:00Z"
+            ):
+                returned_items.extend(page)
+
+        # Token, then timestamp, then a full re-enumeration of the drive
+        assert len(requested_urls) == 3
+        assert "token=" not in requested_urls[2]
+        assert returned_items == items
+
+    @pytest.mark.asyncio
+    async def test_drive_items_when_drive_is_gone(self, client, patch_fetch):
+        drive_id = "12345"
+
+        returned_pages = []
+        with patch.object(client, "drive_items_delta", side_effect=ResourceGone()):
+            async for page in client.drive_items(drive_id):
+                returned_pages.append(page)
+
+        # No delta token was in play, so the drive itself is gone: skip it silently
+        assert returned_pages == []
 
     @pytest.mark.asyncio
     async def test_download_drive_item(self, client, patch_pipe):

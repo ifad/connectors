@@ -796,6 +796,7 @@ class SharepointOnlineDataSource(BaseDataSource):
                         url=delta_link,
                         site=site,
                         metadata_enricher=self.metadata_enricher,
+                        resume_from=self.last_sync_time(),
                     ):
                         for drive_items_batch in iterable_batches_generator(
                             page.items, SPO_API_MAX_BATCH_SIZE
