@@ -10,6 +10,7 @@ from collections.abc import Iterable, Sized
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from functools import wraps
+from urllib.parse import quote
 
 import aiohttp
 from aiohttp.client_exceptions import ClientPayloadError, ClientResponseError
@@ -60,6 +61,17 @@ class BadRequestError(Exception):
 
     Similar to the NotFound exception, this allows us to catch edge-case responses that should
     be translated as empty resutls, and let us return []."""
+
+    pass
+
+
+class ResourceGone(Exception):
+    """Internal exception class to handle 410s from the API.
+
+    On a delta URL this means the delta token expired or its sync state was dropped
+    by the API (resyncRequired/syncStateNotFound). Replaying the same URL can never
+    succeed, so it's not retryable - a new token has to be requested instead.
+    """
 
     pass
 
@@ -296,7 +308,7 @@ def retryable_aiohttp_call(retries):
                     async for item in func(*args, **kwargs, retry_count=retry):
                         yield item
                     break
-                except (NotFound, BadRequestError):
+                except (NotFound, BadRequestError, ResourceGone):
                     raise
                 except Exception:
                     if retry >= retries:
@@ -476,6 +488,9 @@ class MicrosoftAPISession:
             raise PermissionsMissing(msg) from e
         elif e.status == 404:
             raise NotFound from e  # We wanna catch it in the code that uses this and ignore in some cases
+        elif e.status == 410:
+            self._logger.warning(f"Received 410 Gone response from {absolute_url}")
+            raise ResourceGone from e
         elif e.status == 500:
             raise InternalServerError from e
         elif e.status == 400:
@@ -852,20 +867,78 @@ class SharepointOnlineClient:
             delta_link = (
                 response[DELTA_LINK_KEY] if DELTA_LINK_KEY in response else None
             )
-            if "value" in response and len(response["value"]) > 0:
-                yield DriveItemsPage(response["value"], delta_link)
+            items = response.get("value", [])
+            # The last page is yielded even when it holds no items, so that a drive
+            # without changes still hands its fresh deltaLink to the sync cursor.
+            # Otherwise the cursor keeps an ageing token until the API expires it.
+            if items or delta_link:
+                yield DriveItemsPage(items, delta_link)
 
-    async def drive_items(self, drive_id, url=None):
-        url = (
-            (
-                f"{GRAPH_API_URL}/drives/{drive_id}/root/delta?$select={DRIVE_ITEMS_FIELDS}"
+    async def drive_items(
+        self,
+        drive_id,
+        url=None,
+        site=None,
+        metadata_enricher=None,
+        resume_from=None,
+    ):
+        # Build field list with conditional ODC properties
+        fields = DRIVE_ITEMS_FIELDS
+
+        # Add ODC managed properties if this is an ODC site
+        is_odc = False
+        if metadata_enricher and hasattr(
+            metadata_enricher, "should_include_odc_properties"
+        ):
+            is_odc = metadata_enricher.should_include_odc_properties(site)
+
+        if is_odc and metadata_enricher:
+            odc_properties = metadata_enricher.get_odc_managed_properties()
+            fields = f"{DRIVE_ITEMS_FIELDS},{odc_properties}"
+
+        base_url = f"{GRAPH_API_URL}/drives/{drive_id}/root/delta?$select={fields}"
+
+        try:
+            async for page in self.drive_items_delta(url or base_url):
+                yield page
+            return
+        except ResourceGone:
+            if not url:
+                # No delta token was involved, so it's the drive itself that's gone
+                self._logger.warning(
+                    f"Drive {drive_id} is no longer available (410 Gone), skipping it."
+                )
+                return
+
+        # The stored delta token expired, or the API dropped the sync state behind it.
+        # Instead of failing the sync, pick the changes up from the last successful sync:
+        # SharePoint accepts a URL encoded timestamp in place of a delta token.
+        # https://learn.microsoft.com/en-us/graph/api/driveitem-delta#example-4-retrieving-delta-results-using-a-timestamp
+        if resume_from:
+            self._logger.warning(
+                f"Delta token for drive {drive_id} is no longer valid (410 Gone), resuming from {resume_from}."
             )
-            if not url
-            else url
-        )
+            try:
+                async for page in self.drive_items_delta(
+                    f"{base_url}&token={quote(resume_from, safe='')}"
+                ):
+                    yield page
+                return
+            except ResourceGone:
+                # The timestamp predates the window the API keeps changes for
+                self._logger.warning(
+                    f"Drive {drive_id} cannot be resumed from {resume_from} (410 Gone)."
+                )
 
-        async for page in self.drive_items_delta(url):
-            yield page
+        self._logger.warning(f"Re-enumerating drive {drive_id} from scratch.")
+
+        try:
+            async for page in self.drive_items_delta(base_url):
+                yield page
+        except ResourceGone:
+            self._logger.warning(
+                f"Drive {drive_id} is no longer available (410 Gone), skipping it."
+            )
 
     async def drive_items_permissions_batch(self, drive_id, drive_item_ids):
         requests = []
