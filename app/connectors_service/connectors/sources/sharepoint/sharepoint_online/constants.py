@@ -78,3 +78,11 @@ EXCLUDED_SHAREPOINT_PATH_SEGMENTS = ["/contentstorage/"]
 
 # System / non-content lists that Graph may still return; skip before REST follow-ups
 EXCLUDED_SHAREPOINT_LIST_NAMES = frozenset({"SharePointHomeCacheList"})
+
+# Set on documents whose text could not be extracted, and only on those, so they
+# can be found with a single exists query and re-indexed once OCR is available.
+# Roughly a third of this corpus is scanned PDFs, which convert without error
+# into image placeholders alone; recording that as an empty body would lose the
+# distinction from a file that is simply empty.
+EXTRACTION_STATE_FIELD = "extraction_state"
+UNEXTRACTED_STATE = "unextracted"

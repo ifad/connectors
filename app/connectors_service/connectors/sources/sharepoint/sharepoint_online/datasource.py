@@ -31,10 +31,12 @@ from connectors.sources.sharepoint.sharepoint_online.client import (
 from connectors.sources.sharepoint.sharepoint_online.constants import (
     CURSOR_SITE_DRIVE_KEY,
     EXCLUDED_SHAREPOINT_LIST_NAMES,
+    EXTRACTION_STATE_FIELD,
     MAX_DOCUMENT_SIZE,
     SPO_API_MAX_BATCH_SIZE,
     SPO_MAX_EXPAND_SIZE,
     TIMESTAMP_FORMAT,
+    UNEXTRACTED_STATE,
     VIEW_ITEM_MASK,
     VIEW_PAGE_MASK,
     VIEW_ROLE_TYPES,
@@ -1541,7 +1543,7 @@ class SharepointOnlineDataSource(BaseDataSource):
             "_timestamp": new_timestamp,
         }
 
-        attached_file, body = await self._download_content(
+        attached_file, body, extraction_state = await self._download_content(
             partial(self.client.download_attachment, attachment["odata.id"]),
             attachment["_original_filename"],
         )
@@ -1551,6 +1553,8 @@ class SharepointOnlineDataSource(BaseDataSource):
         if body is not None:
             # accept empty strings for body
             doc["body"] = body
+        if extraction_state:
+            doc[EXTRACTION_STATE_FIELD] = extraction_state
 
         return doc
 
@@ -1571,7 +1575,7 @@ class SharepointOnlineDataSource(BaseDataSource):
             "_timestamp": drive_item["lastModifiedDateTime"],
         }
 
-        attached_file, body = await self._download_content(
+        attached_file, body, extraction_state = await self._download_content(
             partial(
                 self.client.download_drive_item,
                 drive_item["parentReference"]["driveId"],
@@ -1585,12 +1589,15 @@ class SharepointOnlineDataSource(BaseDataSource):
         if body is not None:
             # accept empty strings for body
             doc["body"] = body
+        if extraction_state:
+            doc[EXTRACTION_STATE_FIELD] = extraction_state
 
         return doc
 
     async def _download_content(self, download_func, original_filename):
         attachment = None
         body = None
+        extraction_state = None
         source_file_name = ""
         file_extension = os.path.splitext(original_filename)[-1].lower()
 
@@ -1615,6 +1622,14 @@ class SharepointOnlineDataSource(BaseDataSource):
                 body = await self.markdown_client.convert_file(
                     source_file_name, original_filename
                 )
+                if ConvertMarkdownClient.yielded_no_text(body):
+                    # A scanned PDF converts to nothing but image placeholders
+                    # while OCR is off, and a failed conversion returns "".
+                    # Neither is content, so drop it and mark the document
+                    # instead — an empty body on its own cannot be told apart
+                    # from a genuinely empty file when it is time to re-extract.
+                    body = ""
+                    extraction_state = UNEXTRACTED_STATE
             elif self.configuration["use_text_extraction_service"]:
                 body = ""
                 if self.extraction_service._check_configured():
@@ -1634,7 +1649,7 @@ class SharepointOnlineDataSource(BaseDataSource):
             if source_file_name:
                 await remove(str(source_file_name))
 
-        return attachment, body
+        return attachment, body, extraction_state
 
     async def ping(self):
         pass

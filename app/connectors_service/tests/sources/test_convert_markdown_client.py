@@ -49,6 +49,29 @@ class TestIsConvertible:
         assert ConvertMarkdownClient.is_convertible(filename) is expected
 
 
+class TestYieldedNoText:
+    @pytest.mark.parametrize(
+        "markdown, expected",
+        [
+            # A scanned PDF with OCR off: Docling lays out the pictures it finds
+            # and returns their placeholders and nothing else, one per image.
+            ("<!-- image -->", True),
+            ("<!-- image -->\n\n<!-- image -->", True),
+            ("<!--image-->\n\n<!--  image  -->", True),
+            # A failed or skipped conversion.
+            ("", True),
+            ("   \n\n  ", True),
+            (None, True),
+            # Real content, including a document carrying both text and images.
+            ("# Report\n\nBody text", False),
+            ("<!-- image -->\n\nCaption under the figure", False),
+            ("| a | b |\n| - | - |", False),
+        ],
+    )
+    def test_yielded_no_text(self, markdown, expected):
+        assert ConvertMarkdownClient.yielded_no_text(markdown) is expected
+
+
 @pytest.mark.asyncio
 class TestConvertFile:
     async def test_returns_markdown_when_submit_finishes_inline(self, client, pdf_file):

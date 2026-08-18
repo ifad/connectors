@@ -47,6 +47,8 @@ from connectors.sources.sharepoint.sharepoint_online.constants import (
     DEFAULT_BACKOFF_MULTIPLIER,
     DEFAULT_RETRY_SECONDS,
     EXCLUDED_SHAREPOINT_LIST_NAMES,
+    EXTRACTION_STATE_FIELD,
+    UNEXTRACTED_STATE,
     WILDCARD,
 )
 from connectors.sources.sharepoint.sharepoint_online.utils import (
@@ -3510,6 +3512,57 @@ class TestSharepointOnlineDataSource:
             source._markdown_client.convert_file.assert_awaited_once()
             assert download_result["body"] == "# Heading"
             assert "_attachment" not in download_result
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "markdown",
+        ["<!-- image -->\n\n<!-- image -->", ""],
+        ids=["placeholders_only", "conversion_failed"],
+    )
+    async def test_markdown_conversion_without_text_marks_document(
+        self, patch_sharepoint_client, markdown
+    ):
+        # A scanned PDF converts into image placeholders alone while OCR is off,
+        # and a failed conversion returns "". Neither is content: the body must
+        # not carry the placeholders, and the document has to stay findable so
+        # it can be re-extracted once OCR is available.
+        attachment = {"odata.id": "1", "_original_filename": "scan.pdf"}
+
+        async def download_func(attachment_id, async_buffer):
+            await async_buffer.write(b"%PDF-1.4 scanned")
+
+        patch_sharepoint_client.download_attachment = download_func
+        async with create_spo_source(use_markdown_conversion=True) as source:
+            source._markdown_client = AsyncMock()
+            source._markdown_client.stats = (1, 0, 0)
+            source._markdown_client.convert_file = AsyncMock(return_value=markdown)
+
+            download_result = await source.get_attachment_content(attachment, doit=True)
+
+            assert download_result["body"] == ""
+            assert download_result[EXTRACTION_STATE_FIELD] == UNEXTRACTED_STATE
+
+    @pytest.mark.asyncio
+    async def test_markdown_conversion_with_text_is_not_marked(
+        self, patch_sharepoint_client
+    ):
+        attachment = {"odata.id": "1", "_original_filename": "report.pdf"}
+
+        async def download_func(attachment_id, async_buffer):
+            await async_buffer.write(b"%PDF-1.4 born digital")
+
+        patch_sharepoint_client.download_attachment = download_func
+        async with create_spo_source(use_markdown_conversion=True) as source:
+            source._markdown_client = AsyncMock()
+            source._markdown_client.stats = (1, 0, 0)
+            source._markdown_client.convert_file = AsyncMock(
+                return_value="<!-- image -->\n\nReal text under the figure"
+            )
+
+            download_result = await source.get_attachment_content(attachment, doit=True)
+
+            assert "Real text" in download_result["body"]
+            assert EXTRACTION_STATE_FIELD not in download_result
 
     @pytest.mark.asyncio
     async def test_markdown_conversion_falls_through_for_unconvertible_file(

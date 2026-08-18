@@ -18,6 +18,7 @@ minutes, far longer than a gateway will hold a request open.
 import asyncio
 import hashlib
 import os
+import re
 from dataclasses import dataclass
 
 import aiofiles
@@ -32,6 +33,12 @@ CONVERTIBLE_EXTENSIONS = (".pdf", ".docx", ".xlsx", ".pptx", ".html", ".htm")
 LEGACY_EXTENSIONS = (".doc", ".xls", ".ppt")
 
 DEFAULT_BASE_URL = "http://convert-markdown:8000"
+
+# Docling emits this placeholder for every picture it lays out. A scanned PDF has
+# no text layer, so with OCR disabled it converts "successfully" into nothing but
+# these — around a third of this corpus. Such a body is not content, and indexing
+# it as content buries a document that is really still waiting to be extracted.
+IMAGE_PLACEHOLDER_PATTERN = re.compile(r"<!--\s*image\s*-->")
 
 
 @dataclass(frozen=True)
@@ -132,6 +139,18 @@ class ConvertMarkdownClient:
         if not filename or "." not in filename:
             return False
         return os.path.splitext(filename)[-1].lower() in CONVERTIBLE_EXTENSIONS
+
+    @classmethod
+    def yielded_no_text(cls, markdown):
+        """Whether a conversion produced nothing indexable.
+
+        True for an empty result (a failed or skipped conversion) and for one
+        made up only of image placeholders, which is what a scanned PDF returns
+        while OCR is off. Both mean the document's text is still unextracted, so
+        callers can mark it and revisit it rather than record an empty body as a
+        successful extraction.
+        """
+        return not IMAGE_PLACEHOLDER_PATTERN.sub("", markdown or "").strip()
 
     def _begin_session(self):
         if self._session is not None:
