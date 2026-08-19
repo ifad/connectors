@@ -27,7 +27,7 @@ import aiohttp
 # File extensions worth sending to convert-markdown. Checked here so an
 # unsupported document costs no upload; convert-markdown re-validates and
 # remains the authority on what it can parse.
-CONVERTIBLE_EXTENSIONS = (".pdf", ".docx", ".xlsx", ".pptx", ".html", ".htm")
+CONVERTIBLE_EXTENSIONS = (".pdf", ".docx", ".xlsx", ".pptx", ".html", ".htm", ".csv")
 
 # Legacy binary Office formats that Docling cannot parse.
 LEGACY_EXTENSIONS = (".doc", ".xls", ".ppt")

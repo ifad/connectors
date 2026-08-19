@@ -32,6 +32,7 @@ from connectors.sources.sharepoint.sharepoint_online.constants import (
     CURSOR_SITE_DRIVE_KEY,
     EXCLUDED_SHAREPOINT_LIST_NAMES,
     EXTRACTION_STATE_FIELD,
+    IGNORED_EXTENSIONS,
     MAX_DOCUMENT_SIZE,
     SPO_API_MAX_BATCH_SIZE,
     SPO_MAX_EXPAND_SIZE,
@@ -727,11 +728,33 @@ class SharepointOnlineDataSource(BaseDataSource):
                         for drive_items_batch in iterable_batches_generator(
                             page.items, SPO_API_MAX_BATCH_SIZE
                         ):
+                            # One $batch round-trip for the whole page-batch. The
+                            # per-item call this replaces was awaited inside the
+                            # loop below, so it stalled this generator — and with
+                            # it every download and conversion downstream — once
+                            # per document.
+                            list_fields = {}
+                            if self.configuration.get("enrich_metadata", True):
+                                list_fields = await self.metadata_enricher.get_drive_item_list_fields_batch(
+                                    site_drive["id"],
+                                    [
+                                        item["id"]
+                                        for item in drive_items_batch
+                                        if item.get("id")
+                                        and not self.is_ignored_file(
+                                            item.get("name", "")
+                                        )
+                                    ],
+                                )
+
                             async for (
                                 drive_item
                             ) in self._drive_items_batch_with_permissions(
                                 site_drive["id"], drive_items_batch, site["webUrl"]
                             ):
+                                if self.is_ignored_file(drive_item.get("name", "")):
+                                    continue
+
                                 drive_item["_id"] = drive_item["id"]
                                 drive_item["object_type"] = "drive_item"
                                 drive_item["_timestamp"] = drive_item.get(
@@ -740,8 +763,9 @@ class SharepointOnlineDataSource(BaseDataSource):
 
                                 # Enrich drive item with SharePoint list metadata
                                 if self.configuration.get("enrich_metadata", True):
-                                    drive_item = await self.metadata_enricher.enrich_drive_item_with_list_metadata(
-                                        drive_item, site["id"]
+                                    drive_item = self.metadata_enricher.apply_list_metadata(
+                                        drive_item,
+                                        list_fields.get(drive_item.get("id")),
                                     )
                                 # Enrich with metadata
                                 drive_item = self._enrich_document_with_metadata(
@@ -865,11 +889,33 @@ class SharepointOnlineDataSource(BaseDataSource):
                         for drive_items_batch in iterable_batches_generator(
                             page.items, SPO_API_MAX_BATCH_SIZE
                         ):
+                            # One $batch round-trip for the whole page-batch. The
+                            # per-item call this replaces was awaited inside the
+                            # loop below, so it stalled this generator — and with
+                            # it every download and conversion downstream — once
+                            # per document.
+                            list_fields = {}
+                            if self.configuration.get("enrich_metadata", True):
+                                list_fields = await self.metadata_enricher.get_drive_item_list_fields_batch(
+                                    site_drive["id"],
+                                    [
+                                        item["id"]
+                                        for item in drive_items_batch
+                                        if item.get("id")
+                                        and not self.is_ignored_file(
+                                            item.get("name", "")
+                                        )
+                                    ],
+                                )
+
                             async for (
                                 drive_item
                             ) in self._drive_items_batch_with_permissions(
                                 site_drive["id"], drive_items_batch, site["webUrl"]
                             ):
+                                if self.is_ignored_file(drive_item.get("name", "")):
+                                    continue
+
                                 drive_item["_id"] = drive_item["id"]
                                 drive_item["object_type"] = "drive_item"
                                 drive_item["_timestamp"] = drive_item.get(
@@ -878,8 +924,9 @@ class SharepointOnlineDataSource(BaseDataSource):
 
                                 # Enrich drive item with SharePoint list metadata
                                 if self.configuration.get("enrich_metadata", True):
-                                    drive_item = await self.metadata_enricher.enrich_drive_item_with_list_metadata(
-                                        drive_item, site["id"]
+                                    drive_item = self.metadata_enricher.apply_list_metadata(
+                                        drive_item,
+                                        list_fields.get(drive_item.get("id")),
                                     )
                                 # Enrich with metadata
                                 drive_item = self._enrich_document_with_metadata(
@@ -1090,6 +1137,9 @@ class SharepointOnlineDataSource(BaseDataSource):
             metadata_enricher=self.metadata_enricher,
         ):
             for drive_item in page:
+                if self.is_ignored_file(drive_item.get("name", "")):
+                    continue
+
                 drive_item["_id"] = drive_item["id"]
                 drive_item["object_type"] = "drive_item"
                 drive_item["_timestamp"] = drive_item["lastModifiedDateTime"]
@@ -1669,6 +1719,17 @@ class SharepointOnlineDataSource(BaseDataSource):
 
     def advanced_rules_validators(self):
         return [SharepointOnlineAdvancedRulesValidator()]
+
+    def is_ignored_file(self, filename):
+        """Whether ``filename`` is a format we do not index at all.
+
+        Distinct from is_supported_format, which only decides whether to
+        download content: an unsupported file is still indexed as a
+        metadata-only record. These are dropped entirely.
+        """
+        if not filename:
+            return False
+        return os.path.splitext(filename)[-1].lower() in IGNORED_EXTENSIONS
 
     def is_supported_format(self, filename):
         if "." not in filename:

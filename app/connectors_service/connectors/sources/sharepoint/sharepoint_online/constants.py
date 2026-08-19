@@ -34,6 +34,15 @@ DEFAULT_PARALLEL_CONNECTION_COUNT = 10
 DEFAULT_BACKOFF_MULTIPLIER = 5
 FILE_WRITE_CHUNK_SIZE = 1024 * 64  # 64KB default SSD page size
 MAX_DOCUMENT_SIZE = 10485760
+
+# Media and other non-textual formats. These carry no extractable text, so they
+# were already skipped for download — but the document was still yielded and
+# indexed as a metadata-only record, which is search noise. Skipping them at the
+# source also spares each one a listItem/fields round-trip during enrichment.
+IGNORED_EXTENSIONS = (
+    ".mp4", ".m4v", ".mov", ".avi", ".wmv", ".mkv", ".webm", ".flv", ".mpg", ".mpeg",
+    ".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".wma",
+)
 WILDCARD = "*"
 DRIVE_ITEMS_FIELDS = "id,content.downloadUrl,lastModifiedDateTime,lastModifiedBy,root,deleted,file,folder,package,name,webUrl,createdBy,createdDateTime,size,parentReference"
 
