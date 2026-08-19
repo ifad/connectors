@@ -32,8 +32,17 @@ from connectors_sdk.utils import (
 )
 
 from connectors.config import (
+    DEFAULT_CHUNK_MAX_MEM_SIZE,
+    DEFAULT_CHUNK_SIZE,
+    DEFAULT_CONCURRENT_DOWNLOADS,
+    DEFAULT_DISPLAY_EVERY,
     DEFAULT_ELASTICSEARCH_MAX_RETRIES,
     DEFAULT_ELASTICSEARCH_RETRY_INTERVAL,
+    DEFAULT_MAX_CONCURRENCY,
+    DEFAULT_QUEUE_MAX_MEM_SIZE,
+    DEFAULT_QUEUE_MAX_SIZE,
+    DEFAULT_QUEUE_REFRESH_INTERVAL,
+    DEFAULT_QUEUE_REFRESH_TIMEOUT,
 )
 from connectors.es import TIMESTAMP_FIELD
 from connectors.es.management_client import ESManagementClient
@@ -44,13 +53,6 @@ from connectors.protocol.connectors import (
     INDEXED_DOCUMENT_VOLUME,
 )
 from connectors.utils import (
-    DEFAULT_CHUNK_MEM_SIZE,
-    DEFAULT_CHUNK_SIZE,
-    DEFAULT_CONCURRENT_DOWNLOADS,
-    DEFAULT_DISPLAY_EVERY,
-    DEFAULT_MAX_CONCURRENCY,
-    DEFAULT_QUEUE_MEM_SIZE,
-    DEFAULT_QUEUE_SIZE,
     ConcurrentTasks,
     Counters,
     ErrorMonitor,
@@ -202,19 +204,21 @@ class Sink:
         # TODO: retry 429s for individual items here
         res = await self.client.bulk_insert(operations, self.pipeline["name"])
         ids_to_ops = self._map_id_to_op(operations)
-        await self._process_bulk_response(
-            res, ids_to_ops, do_log=self._enable_bulk_operations_logging
-        )
-
-        if res.get("errors"):
-            for item in res["items"]:
-                for op, data in item.items():
-                    if "error" in data:
-                        self._logger.error(
-                            f"operation {op} failed for doc {data['_id']}, {data['error']}"
-                        )
-
-        self._populate_stats(stats, res)
+        # `_process_bulk_response` can raise mid-response, so log failures and
+        # populate stats in `finally` to still count already-accepted docs.
+        try:
+            await self._process_bulk_response(
+                res, ids_to_ops, do_log=self._enable_bulk_operations_logging
+            )
+        finally:
+            if res.get("errors"):
+                for item in res["items"]:
+                    for op, data in item.items():
+                        if "error" in data:
+                            self._logger.error(
+                                f"operation {op} failed for doc {data['_id']}, {data['error']}"
+                            )
+            self._populate_stats(stats, res)
 
         return res
 
@@ -371,10 +375,24 @@ class Sink:
             stats = {OP_INDEX: {}, OP_UPDATE: {}, OP_DELETE: {}}
             bulk_size = 0
             overhead_size = None
-            batch_num = 0
+            batch_num = 0  # incremented per dispatched batch
+
+            async def _dispatch_batch():
+                nonlocal batch_num, stats, bulk_size
+                batch_num += 1
+                await self.bulk_tasks.put(
+                    functools.partial(
+                        self._batch_bulk,
+                        copy.copy(batch),
+                        copy.copy(stats),
+                    ),
+                    name=f"Elasticsearch Sink: _bulk batch #{batch_num}",
+                )
+                batch.clear()
+                stats = {OP_INDEX: {}, OP_UPDATE: {}, OP_DELETE: {}}
+                bulk_size = 0
 
             while True:
-                batch_num += 1
                 doc_size, doc = await self.fetch_doc()
                 if doc in (END_DOCS, EXTRACTOR_ERROR):
                     break
@@ -383,6 +401,16 @@ class Sink:
                 if not doc_id:
                     self._logger.warning(f"Skip document {doc} as '_id' is missing.")
                     continue
+                # Flush before adding if this doc would overflow either cap.
+                # `_bulk_op` emits 1 entry for deletes and 2 for index/update,
+                # so we compare prospective rather than current entry count.
+                entries = 1 if operation == OP_DELETE else 2
+                if batch and (
+                    len(batch) + entries > self.chunk_size
+                    or bulk_size + doc_size > self.chunk_mem_size
+                ):
+                    await _dispatch_batch()
+
                 if operation == OP_DELETE:
                     stats[operation][doc_id] = 0
                 else:
@@ -398,20 +426,12 @@ class Sink:
                     stats[operation][doc_id] = max(doc_size - overhead_size, 0)
                 self.counters.increment(operation, namespace=BULK_OPERATIONS)
                 batch.extend(self._bulk_op(doc, operation))
-
                 bulk_size += doc_size
-                if len(batch) >= self.chunk_size or bulk_size > self.chunk_mem_size:
-                    await self.bulk_tasks.put(
-                        functools.partial(
-                            self._batch_bulk,
-                            copy.copy(batch),
-                            copy.copy(stats),
-                        ),
-                        name=f"Elasticsearch Sink: _bulk batch #{batch_num}",
-                    )
-                    batch.clear()
-                    stats = {OP_INDEX: {}, OP_UPDATE: {}, OP_DELETE: {}}
-                    bulk_size = 0
+
+                # Also flush when this doc fills the batch up to (or past) the
+                # cap, so a full batch isn't held waiting for the next doc.
+                if len(batch) >= self.chunk_size or bulk_size >= self.chunk_mem_size:
+                    await _dispatch_batch()
 
                 await asyncio.sleep(0)
                 self.bulk_tasks.raise_any_exception()
@@ -856,7 +876,9 @@ class SyncOrchestrator:
         self.error = None
         self.canceled = False
         error_monitor_config = elastic_config.get("bulk", {}).get("error_monitor", {})
-        self.error_monitor = ErrorMonitor(error_monitor_config)
+        # Unpack as kwargs; passing the dict positionally would bind it to
+        # `enabled` and silently default every threshold.
+        self.error_monitor = ErrorMonitor(**error_monitor_config)
 
     async def close(self):
         await self.es_management_client.close()
@@ -1009,10 +1031,10 @@ class SyncOrchestrator:
             filter_ = Filter()
         if options is None:
             options = {}
-        queue_size = options.get("queue_max_size", DEFAULT_QUEUE_SIZE)
+        queue_size = options.get("queue_max_size", DEFAULT_QUEUE_MAX_SIZE)
         display_every = options.get("display_every", DEFAULT_DISPLAY_EVERY)
-        queue_mem_size = options.get("queue_max_mem_size", DEFAULT_QUEUE_MEM_SIZE)
-        chunk_mem_size = options.get("chunk_max_mem_size", DEFAULT_CHUNK_MEM_SIZE)
+        queue_mem_size = options.get("queue_max_mem_size", DEFAULT_QUEUE_MAX_MEM_SIZE)
+        chunk_mem_size = options.get("chunk_max_mem_size", DEFAULT_CHUNK_MAX_MEM_SIZE)
         max_concurrency = options.get("max_concurrency", DEFAULT_MAX_CONCURRENCY)
         chunk_size = options.get("chunk_size", DEFAULT_CHUNK_SIZE)
         concurrent_downloads = options.get(
@@ -1022,8 +1044,12 @@ class SyncOrchestrator:
         retry_interval = options.get(
             "retry_interval", DEFAULT_ELASTICSEARCH_RETRY_INTERVAL
         )
-        mem_queue_refresh_timeout = options.get("queue_refresh_timeout", 60)
-        mem_queue_refresh_interval = options.get("queue_refresh_interval", 1)
+        mem_queue_refresh_timeout = options.get(
+            "queue_refresh_timeout", DEFAULT_QUEUE_REFRESH_TIMEOUT
+        )
+        mem_queue_refresh_interval = options.get(
+            "queue_refresh_interval", DEFAULT_QUEUE_REFRESH_INTERVAL
+        )
 
         stream = MemQueue(
             maxsize=queue_size,

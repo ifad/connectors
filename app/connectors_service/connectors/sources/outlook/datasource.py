@@ -4,20 +4,33 @@
 # you may not use this file except in compliance with the Elastic License 2.0.
 #
 
+import ssl
 from copy import copy
 from functools import cached_property, partial
 
-from connectors_sdk.source import BaseDataSource
+from connectors_sdk.source import BaseDataSource, ConfigurableFieldValueError
 from connectors_sdk.utils import (
     hash_id,
     iso_utc,
 )
+from exchangelib import UTC
+from exchangelib.attachments import FileAttachment
+from exchangelib.errors import ErrorAccessDenied, ErrorNonExistentMailbox
+from exchangelib.items import (
+    CalendarItem,
+    Contact,
+    DistributionList,
+    MeetingCancellation,
+    MeetingRequest,
+    MeetingResponse,
+    Message,
+    Task,
+)
 
 from connectors.access_control import ACCESS_CONTROL, es_access_control_query
-from connectors.sources.outlook.client import OutlookClient
+from connectors.sources.outlook.client import OutlookClient, _extract_ldap_mail
 from connectors.sources.outlook.constants import (
     CALENDAR_ATTACHMENT,
-    DEFAULT_TIMEZONE,
     MAIL_ATTACHMENT,
     OUTLOOK_CLOUD,
     OUTLOOK_SERVER,
@@ -32,9 +45,32 @@ from connectors.sources.outlook.utils import (
 )
 from connectors.utils import html_to_text
 
+# Item types each formatter can render; a test keeps them in sync with exchangelib.
+MAIL_ITEM_TYPES = (Message, MeetingRequest, MeetingResponse, MeetingCancellation)
+CALENDAR_ITEM_TYPES = (CalendarItem,)
+TASK_ITEM_TYPES = (Task,)
+
+
+def _mailbox_access_control(account):
+    """Identities allowed to read everything in a mailbox.
+
+    These have to stay in the same dialect as the identities granted by
+    `_user_access_control_doc`: DLS matches the two with a terms query, so an
+    address stored here unprefixed is invisible to every user.
+    """
+    return [_prefix_email(account.primary_smtp_address)]
+
 
 class OutlookDocFormatter:
     """Format Outlook object documents to Elasticsearch document"""
+
+    @staticmethod
+    def _calendar_meeting_type(calendar):
+        if calendar.type == "Single":
+            return "Single"
+        if calendar.recurrence and calendar.recurrence.pattern:
+            return f"Recurring {calendar.recurrence.pattern}"
+        return calendar.type
 
     def mails_doc_formatter(self, mail, mail_type, timezone):
         return {
@@ -44,15 +80,21 @@ class OutlookDocFormatter:
             ),
             "title": mail.subject,
             "type": mail_type["constant"],
-            "sender": mail.sender.email_address,
+            "sender": mail.sender.email_address if mail.sender else None,
             "to_recipients": [
-                recipient.email_address for recipient in (mail.to_recipients or [])
+                recipient.email_address
+                for recipient in (mail.to_recipients or [])
+                if recipient and recipient.email_address
             ],
             "cc_recipients": [
-                recipient.email_address for recipient in (mail.cc_recipients or [])
+                recipient.email_address
+                for recipient in (mail.cc_recipients or [])
+                if recipient and recipient.email_address
             ],
             "bcc_recipients": [
-                recipient.email_address for recipient in (mail.bcc_recipients or [])
+                recipient.email_address
+                for recipient in (mail.bcc_recipients or [])
+                if recipient and recipient.email_address
             ],
             "importance": mail.importance,
             "categories": list((mail.categories or [])),
@@ -67,18 +109,20 @@ class OutlookDocFormatter:
             ),
             "type": "Calendar",
             "title": calendar.subject,
-            "meeting_type": "Single"
-            if calendar.type == "Single"
-            else f"Recurring {calendar.recurrence.pattern}",
-            "organizer": calendar.organizer.email_address,
+            "meeting_type": self._calendar_meeting_type(calendar),
+            "organizer": calendar.organizer.email_address
+            if calendar.organizer
+            else None,
         }
 
         if child_calendar in ["Folder (Birthdays)", "Birthdays (Birthdays)"]:
+            # calendar.start may be missing; guard against splitting a None.
+            birthday = ews_format_to_datetime(
+                source_datetime=calendar.start, timezone=timezone
+            )
             document.update(
                 {
-                    "date": ews_format_to_datetime(
-                        source_datetime=calendar.start, timezone=timezone
-                    ).split("T", 1)[0],
+                    "date": birthday.split("T", 1)[0] if birthday else None,
                 }
             )
         else:
@@ -87,7 +131,9 @@ class OutlookDocFormatter:
                     "attendees": [
                         attendee.mailbox.email_address
                         for attendee in (calendar.required_attendees or [])
-                        if attendee.mailbox.email_address
+                        if attendee
+                        and attendee.mailbox
+                        and attendee.mailbox.email_address
                     ],
                     "start_date": ews_format_to_datetime(
                         source_datetime=calendar.start, timezone=timezone
@@ -135,12 +181,14 @@ class OutlookDocFormatter:
             ),
             "name": contact.display_name,
             "email_addresses": [
-                email.email for email in (contact.email_addresses or [])
+                email.email
+                for email in (contact.email_addresses or [])
+                if email and email.email
             ],
             "contact_numbers": [
                 number.phone_number
-                for number in contact.phone_numbers or []
-                if number.phone_number
+                for number in (contact.phone_numbers or [])
+                if number and number.phone_number
             ],
             "company_name": contact.company_name,
             "birthday": ews_format_to_datetime(
@@ -148,9 +196,29 @@ class OutlookDocFormatter:
             ),
         }
 
-    def attachment_doc_formatter(self, attachment, attachment_type, timezone):
+    def distribution_list_doc_formatter(self, distribution_list, timezone):
+        # A contact group has members, not per-contact fields, so it needs its own shape.
         return {
-            "_id": attachment.attachment_id.id,
+            "_id": distribution_list.id,
+            "type": "Distribution List",
+            "_timestamp": ews_format_to_datetime(
+                source_datetime=distribution_list.last_modified_time,
+                timezone=timezone,
+            ),
+            "name": distribution_list.display_name,
+            "email_addresses": [
+                member.mailbox.email_address
+                for member in (distribution_list.members or [])
+                if member and member.mailbox and member.mailbox.email_address
+            ],
+        }
+
+    def attachment_doc_formatter(self, attachment, attachment_type, timezone):
+        attachment_id = (
+            attachment.attachment_id.id if attachment.attachment_id else None
+        )
+        return {
+            "_id": attachment_id,
             "title": attachment.name,
             "type": attachment_type,
             "_timestamp": ews_format_to_datetime(
@@ -294,6 +362,43 @@ class OutlookDataSource(BaseDataSource):
             },
         }
 
+    async def validate_config(self):
+        """Validate the configuration and the SSL certificate content.
+
+        The base field checks only confirm the certificate is present; this also
+        confirms it actually loads, so a bad certificate fails here instead of
+        mid-sync with an opaque SSL error.
+
+        Raises:
+            ConfigurableFieldValueError: if SSL is enabled for an Exchange server
+                source but the certificate is not a loadable PEM certificate.
+        """
+        await super().validate_config()
+        self._validate_ssl_certificate()
+
+    def _validate_ssl_certificate(self):
+        if (
+            self.configuration["data_source"] != OUTLOOK_SERVER
+            or not self.configuration["ssl_enabled"]
+        ):
+            return
+
+        # The base already rejects a missing field; here we confirm the cert
+        # actually loads (as the sync path does) so it fails now, not mid-sync.
+        # An empty cadata is treated as invalid, since it would silently fall
+        # back to the system CAs.
+        try:
+            if not self.client.ssl_ca:
+                empty_cert_msg = "certificate is empty after normalization"
+                raise ValueError(empty_cert_msg)
+            ssl.create_default_context(cadata=self.client.ssl_ca)
+        except (ssl.SSLError, ValueError) as exception:
+            msg = (
+                "The provided SSL certificate is not valid. Provide a valid "
+                "PEM-encoded certificate."
+            )
+            raise ConfigurableFieldValueError(msg) from exception
+
     def _dls_enabled(self):
         """Check if document level security is enabled. This method checks whether document level security (DLS) is enabled based on the provided configuration.
 
@@ -317,7 +422,7 @@ class OutlookDataSource(BaseDataSource):
             if self.configuration["data_source"] == OUTLOOK_CLOUD:
                 for user in users.get("value", []):
                     yield await self._user_access_control_doc(user=user)
-            elif users.get("attributes", {}).get("mail"):
+            elif _extract_ldap_mail(users.get("attributes", {})):
                 yield await self._user_access_control_doc_for_server(users=users)
 
     async def _user_access_control_doc(self, user):
@@ -344,9 +449,13 @@ class OutlookDataSource(BaseDataSource):
         )
 
     async def _user_access_control_doc_for_server(self, users):
-        name_metadata = users.get("dn", "").split("=", 1)[1]
-        display_name = name_metadata.split(",", 1)[0]
-        user_email = users.get("attributes", {}).get("mail")
+        dn = users.get("dn", "")
+        if "=" in dn:
+            name_metadata = dn.split("=", 1)[1]
+            display_name = name_metadata.split(",", 1)[0]
+        else:
+            display_name = dn or ""
+        user_email = _extract_ldap_mail(users.get("attributes", {}))
         user_id = hash_id(user_email)
 
         _prefixed_user_id = _prefix_user_id(user_id=user_id)
@@ -366,8 +475,9 @@ class OutlookDataSource(BaseDataSource):
 
     def _decorate_with_access_control(self, document, access_control):
         if self._dls_enabled():
+            identities = document.get(ACCESS_CONTROL, []) + access_control
             document[ACCESS_CONTROL] = list(
-                set(document.get(ACCESS_CONTROL, []) + access_control)
+                {identity for identity in identities if identity is not None}
             )
         return document
 
@@ -386,11 +496,28 @@ class OutlookDataSource(BaseDataSource):
         Returns:
             dictionary: Content document with _id, _timestamp and attachment content
         """
+        if not attachment.attachment_id:
+            return
+
+        # Only FileAttachment exposes raw `content`; ItemAttachment does not.
+        if not isinstance(attachment, FileAttachment):
+            self._logger.debug(
+                f"Skipping non-file attachment {attachment.attachment_id.id} "
+                f"({type(attachment).__name__})"
+            )
+            return
+
+        # `size` is optional in EWS and may be None.
         file_size = attachment.size
-        if not (doit and file_size > 0):
+        if not (doit and file_size and file_size > 0):
             return
 
         filename = attachment.name
+        if not filename:
+            self._logger.debug(
+                f"Skipping attachment {attachment.attachment_id.id} without a filename"
+            )
+            return
         file_extension = self.get_file_extension(filename)
         if not self.can_file_be_downloaded(
             file_extension,
@@ -424,7 +551,12 @@ class OutlookDataSource(BaseDataSource):
     async def _fetch_attachments(
         self, attachment_type, outlook_object, timezone, account
     ):
-        for attachment in outlook_object.attachments:
+        for attachment in outlook_object.attachments or []:
+            if not attachment.attachment_id:
+                self._logger.warning(
+                    f"Skipping attachment without an ID on item {outlook_object.id}"
+                )
+                continue
             document = self.doc_formatter.attachment_doc_formatter(
                 attachment=attachment,
                 attachment_type=attachment_type,
@@ -432,7 +564,7 @@ class OutlookDataSource(BaseDataSource):
             )
             yield (
                 self._decorate_with_access_control(
-                    document, [account.primary_smtp_address]
+                    document, _mailbox_access_control(account)
                 ),
                 partial(
                     self.get_content, attachment=copy(attachment), timezone=timezone
@@ -441,6 +573,14 @@ class OutlookDataSource(BaseDataSource):
 
     async def _fetch_mails(self, account, timezone):
         async for mail, mail_type in self.client.get_mails(account=account):
+            # Skip strays lacking mail fields (e.g. `sender`).
+            if not isinstance(mail, MAIL_ITEM_TYPES):
+                self._logger.warning(
+                    f"Skipping non-mail item {type(mail).__name__} "
+                    f"({getattr(mail, 'id', 'unknown')}) in "
+                    f"{mail_type['constant']} for {account.primary_smtp_address}"
+                )
+                continue
             document = self.doc_formatter.mails_doc_formatter(
                 mail=mail,
                 mail_type=mail_type,
@@ -448,7 +588,7 @@ class OutlookDataSource(BaseDataSource):
             )
             yield (
                 self._decorate_with_access_control(
-                    document, [account.primary_smtp_address]
+                    document, _mailbox_access_control(account)
                 ),
                 None,
             )
@@ -465,13 +605,29 @@ class OutlookDataSource(BaseDataSource):
     async def _fetch_contacts(self, account, timezone):
         self._logger.debug(f"Fetching contacts for {account.primary_smtp_address}")
         async for contact in self.client.get_contacts(account=account):
-            document = self.doc_formatter.contact_doc_formatter(
-                contact=contact,
-                timezone=timezone,
-            )
+            # Route Contact vs DistributionList; skip anything else.
+            if isinstance(contact, Contact):
+                document = self.doc_formatter.contact_doc_formatter(
+                    contact=contact,
+                    timezone=timezone,
+                )
+            elif isinstance(contact, DistributionList):
+                document = self.doc_formatter.distribution_list_doc_formatter(
+                    distribution_list=contact,
+                    timezone=timezone,
+                )
+            else:
+                self._logger.warning(
+                    f"Skipping unexpected Contacts item type "
+                    f"{type(contact).__name__} "
+                    f"({getattr(contact, 'id', 'unknown')}) for "
+                    f"{account.primary_smtp_address}; expected Contact or "
+                    "DistributionList"
+                )
+                continue
             yield (
                 self._decorate_with_access_control(
-                    document, [account.primary_smtp_address]
+                    document, _mailbox_access_control(account)
                 ),
                 None,
             )
@@ -479,12 +635,20 @@ class OutlookDataSource(BaseDataSource):
     async def _fetch_tasks(self, account, timezone):
         self._logger.debug(f"Fetching tasks for {account.primary_smtp_address}")
         async for task in self.client.get_tasks(account=account):
+            # Skip strays lacking task fields (e.g. `status`).
+            if not isinstance(task, TASK_ITEM_TYPES):
+                self._logger.warning(
+                    f"Skipping non-task item {type(task).__name__} "
+                    f"({getattr(task, 'id', 'unknown')}) in tasks folder "
+                    f"for {account.primary_smtp_address}"
+                )
+                continue
             document = self.doc_formatter.task_doc_formatter(
                 task=task, timezone=timezone
             )
             yield (
                 self._decorate_with_access_control(
-                    document, [account.primary_smtp_address]
+                    document, _mailbox_access_control(account)
                 ),
                 None,
             )
@@ -525,6 +689,15 @@ class OutlookDataSource(BaseDataSource):
                 yield doc
 
     async def _enqueue_calendars(self, calendar, child_calendar, timezone, account):
+        # Skip strays lacking calendar fields (e.g. `type`).
+        if not isinstance(calendar, CALENDAR_ITEM_TYPES):
+            self._logger.warning(
+                f"Skipping non-calendar item {type(calendar).__name__} "
+                f"({getattr(calendar, 'id', 'unknown')}) in calendar folder "
+                f"for {account.primary_smtp_address}"
+            )
+            return
+
         document = self.doc_formatter.calendar_doc_formatter(
             calendar=calendar,
             child_calendar=str(child_calendar),
@@ -532,7 +705,7 @@ class OutlookDataSource(BaseDataSource):
         )
         yield (
             self._decorate_with_access_control(
-                document, [account.primary_smtp_address]
+                document, _mailbox_access_control(account)
             ),
             None,
         )
@@ -561,25 +734,32 @@ class OutlookDataSource(BaseDataSource):
             dictionary: dictionary containing meta-data of the files.
         """
         async for account in self.client._get_user_instance.get_user_accounts():
-            timezone = account.default_timezone or DEFAULT_TIMEZONE
+            timezone = account.default_timezone or UTC
+            try:
+                async for mail in self._fetch_mails(account=account, timezone=timezone):
+                    yield mail
 
-            async for mail in self._fetch_mails(account=account, timezone=timezone):
-                yield mail
+                async for contact in self._fetch_contacts(
+                    account=account, timezone=timezone
+                ):
+                    yield contact
 
-            async for contact in self._fetch_contacts(
-                account=account, timezone=timezone
-            ):
-                yield contact
+                async for task in self._fetch_tasks(account=account, timezone=timezone):
+                    yield task
 
-            async for task in self._fetch_tasks(account=account, timezone=timezone):
-                yield task
+                async for calendar in self._fetch_calendars(
+                    account=account, timezone=timezone
+                ):
+                    yield calendar
 
-            async for calendar in self._fetch_calendars(
-                account=account, timezone=timezone
-            ):
-                yield calendar
-
-            async for child_calendar in self._fetch_child_calendars(
-                account=account, timezone=timezone
-            ):
-                yield child_calendar
+                async for child_calendar in self._fetch_child_calendars(
+                    account=account, timezone=timezone
+                ):
+                    yield child_calendar
+            except (ErrorNonExistentMailbox, ErrorAccessDenied) as error:
+                # Account-specific failure: skip this account. Connection-wide errors
+                # propagate so an empty "successful" sync can't wipe the index.
+                self._logger.warning(
+                    f"Skipping account {account.primary_smtp_address}: "
+                    f"{error.__class__.__name__}."
+                )

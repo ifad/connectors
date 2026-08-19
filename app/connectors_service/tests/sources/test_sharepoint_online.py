@@ -38,6 +38,7 @@ from connectors.sources.sharepoint.sharepoint_online.client import (
     MicrosoftSecurityToken,
     NotFound,
     PermissionsMissing,
+    ResourceGone,
     SharepointRestAPIToken,
     ThrottledError,
     TokenFetchFailed,
@@ -45,6 +46,9 @@ from connectors.sources.sharepoint.sharepoint_online.client import (
 from connectors.sources.sharepoint.sharepoint_online.constants import (
     DEFAULT_BACKOFF_MULTIPLIER,
     DEFAULT_RETRY_SECONDS,
+    EXCLUDED_SHAREPOINT_LIST_NAMES,
+    EXTRACTION_STATE_FIELD,
+    UNEXTRACTED_STATE,
     WILDCARD,
 )
 from connectors.sources.sharepoint.sharepoint_online.utils import (
@@ -61,6 +65,9 @@ from tests.sources.support import create_source
 SITE_LIST_ONE_NAME = "site-list-one-name"
 
 SITE_LIST_ONE_ID = "1"
+
+SHAREPOINT_HOME_CACHE_LIST_NAME = "SharePointHomeCacheList"
+SHAREPOINT_HOME_CACHE_LIST_ID = "sharepoint-home-cache-list-id"
 
 TIMESTAMP_FORMAT_PATCHED = "%Y-%m-%dT%H:%M:%SZ"
 
@@ -245,6 +252,7 @@ async def create_spo_source(
     site_collections=WILDCARD,
     use_document_level_security=False,
     use_text_extraction_service=False,
+    use_markdown_conversion=False,
     fetch_drive_item_permissions=True,
     fetch_unique_list_permissions=True,
     enumerate_all_sites=False,
@@ -261,6 +269,7 @@ async def create_spo_source(
         site_collections=site_collections,
         use_document_level_security=use_document_level_security,
         use_text_extraction_service=use_text_extraction_service,
+        use_markdown_conversion=use_markdown_conversion,
         fetch_drive_item_permissions=fetch_drive_item_permissions,
         fetch_unique_list_permissions=fetch_unique_list_permissions,
         enumerate_all_sites=enumerate_all_sites,
@@ -582,6 +591,24 @@ class TestEntraAPIToken:
 
         assert actual_token == bearer
         assert actual_expires_at == datetime.utcfromtimestamp(expires_at)
+
+    @pytest.mark.asyncio
+    async def test_fetch_token_closes_credentials_when_get_token_fails(
+        self, token, mock_responses, patch_sleep
+    ):
+        certificate_credential_mock = AsyncMock()
+        certificate_credential_mock.get_token = AsyncMock(side_effect=Exception)
+        certificate_credential_mock.close = AsyncMock()
+
+        with patch(
+            "connectors.sources.sharepoint.sharepoint_online.client.CertificateCredential",
+            return_value=certificate_credential_mock,
+        ):
+            with pytest.raises(Exception):
+                await token._fetch_token()
+
+        # One close per attempt, otherwise the underlying aiohttp session leaks
+        assert certificate_credential_mock.close.await_count == 3
 
 
 class TestMicrosoftAPISession:
@@ -948,6 +975,29 @@ class TestMicrosoftAPISession:
                 pass
 
         assert e is not None
+
+    @pytest.mark.asyncio
+    async def test_call_api_with_410_is_not_retried(
+        self,
+        microsoft_api_session,
+        mock_responses,
+        patch_sleep,
+        patch_cancellable_sleeps,
+    ):
+        url = "http://localhost:1234/drives/1/root/delta?token=expired"
+        payload = {"hello": "world"}
+
+        gone_error = ClientResponseError(None, None)
+        gone_error.status = 410
+        gone_error.message = "Gone"
+
+        mock_responses.get(url, exception=gone_error)
+        # Would be served if the call was retried - it must not be
+        mock_responses.get(url, payload=payload)
+
+        with pytest.raises(ResourceGone):
+            async with microsoft_api_session._get(url) as _:
+                pass
 
     @pytest.mark.asyncio
     async def test_call_api_with_400_without_retry_after_header(
@@ -1357,6 +1407,75 @@ class TestSharepointOnlineClient:
 
         assert len(returned_items) == len(items_page_1) + len(items_page_2)
         assert returned_items == items_page_1 + items_page_2
+
+    @pytest.mark.asyncio
+    async def test_drive_items_with_expired_delta_token_resumes_from_timestamp(
+        self, client, patch_fetch
+    ):
+        drive_id = "12345"
+        expired_delta_link = "https://sharepoint.com/delta-link-lalal?token=expired"
+        fresh_delta_link = "https://sharepoint.com/delta-link-lalal?token=fresh"
+        items = ["1", "2"]
+
+        requested_urls = []
+
+        async def drive_items_delta(url):
+            requested_urls.append(url)
+            if url == expired_delta_link:
+                raise ResourceGone()
+            yield DriveItemsPage(items, fresh_delta_link)
+
+        returned_items = []
+        with patch.object(client, "drive_items_delta", drive_items_delta):
+            async for page in client.drive_items(
+                drive_id, url=expired_delta_link, resume_from="2026-07-01T00:00:00Z"
+            ):
+                returned_items.extend(page)
+                assert page.delta_link() == fresh_delta_link
+
+        assert returned_items == items
+        # The timestamp replaces the dead token, and its colons are URL encoded
+        assert "&token=2026-07-01T00%3A00%3A00Z" in requested_urls[1]
+
+    @pytest.mark.asyncio
+    async def test_drive_items_with_expired_delta_token_and_unusable_timestamp(
+        self, client, patch_fetch
+    ):
+        drive_id = "12345"
+        expired_delta_link = "https://sharepoint.com/delta-link-lalal?token=expired"
+        items = ["1", "2"]
+
+        requested_urls = []
+
+        async def drive_items_delta(url):
+            requested_urls.append(url)
+            if "token=" in url:
+                raise ResourceGone()
+            yield DriveItemsPage(items, "https://sharepoint.com/delta-link-lalal/fresh")
+
+        returned_items = []
+        with patch.object(client, "drive_items_delta", drive_items_delta):
+            async for page in client.drive_items(
+                drive_id, url=expired_delta_link, resume_from="2026-07-01T00:00:00Z"
+            ):
+                returned_items.extend(page)
+
+        # Token, then timestamp, then a full re-enumeration of the drive
+        assert len(requested_urls) == 3
+        assert "token=" not in requested_urls[2]
+        assert returned_items == items
+
+    @pytest.mark.asyncio
+    async def test_drive_items_when_drive_is_gone(self, client, patch_fetch):
+        drive_id = "12345"
+
+        returned_pages = []
+        with patch.object(client, "drive_items_delta", side_effect=ResourceGone()):
+            async for page in client.drive_items(drive_id):
+                returned_pages.append(page)
+
+        # No delta token was in play, so the drive itself is gone: skip it silently
+        assert returned_pages == []
 
     @pytest.mark.asyncio
     async def test_download_drive_item(self, client, patch_pipe):
@@ -2351,7 +2470,9 @@ class TestSharepointOnlineDataSource:
 
             yield client
 
-    def drive_items_func(self, drive_id, url=None):
+    def drive_items_func(
+        self, drive_id, url=None, site=None, metadata_enricher=None, resume_from=None
+    ):
         if not url:
             return AsyncIterator(self.drive_items)
         else:
@@ -2597,6 +2718,120 @@ class TestSharepointOnlineDataSource:
                 for site_list in site_lists
             )
             patch_sharepoint_client.site_list_role_assignments.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_site_lists_skips_sharepoint_home_cache_list(
+        self, patch_sharepoint_client
+    ):
+        assert SHAREPOINT_HOME_CACHE_LIST_NAME in EXCLUDED_SHAREPOINT_LIST_NAMES
+        patch_sharepoint_client.site_lists = AsyncIterator(
+            [
+                {
+                    "id": SITE_LIST_ONE_ID,
+                    "name": SITE_LIST_ONE_NAME,
+                    "lastModifiedDateTime": self.day_ago,
+                },
+                {
+                    "id": SHAREPOINT_HOME_CACHE_LIST_ID,
+                    "name": SHAREPOINT_HOME_CACHE_LIST_NAME,
+                    "lastModifiedDateTime": self.day_ago,
+                },
+            ]
+        )
+
+        async with create_spo_source() as source:
+            site = {"id": "1", "webUrl": "https://example.sharepoint.com/sites/Support"}
+            names = [
+                site_list["name"] async for site_list in source.site_lists(site, [])
+            ]
+
+            assert names == [SITE_LIST_ONE_NAME]
+
+    @pytest.mark.asyncio
+    async def test_site_lists_skips_sharepoint_home_cache_list_before_permission_fetch(
+        self, patch_sharepoint_client
+    ):
+        patch_sharepoint_client.site_lists = AsyncIterator(
+            [
+                {
+                    "id": SHAREPOINT_HOME_CACHE_LIST_ID,
+                    "name": SHAREPOINT_HOME_CACHE_LIST_NAME,
+                    "lastModifiedDateTime": self.day_ago,
+                },
+                {
+                    "id": SITE_LIST_ONE_ID,
+                    "name": SITE_LIST_ONE_NAME,
+                    "lastModifiedDateTime": self.day_ago,
+                },
+            ]
+        )
+        patch_sharepoint_client.site_list_role_assignments = AsyncIterator(
+            [
+                {
+                    "Member": {
+                        "odata.type": "SP.User",
+                        "UserPrincipalName": USER_TWO_NAME,
+                    },
+                }
+            ]
+        )
+
+        async with create_spo_source(use_document_level_security=True) as source:
+            site = {"id": "1", "webUrl": "https://example.sharepoint.com/sites/Support"}
+            site_lists = []
+            async for site_list in source.site_lists(site, ["site-acl"]):
+                site_lists.append(site_list)
+
+            assert [site_list["name"] for site_list in site_lists] == [
+                SITE_LIST_ONE_NAME
+            ]
+            patch_sharepoint_client.site_list_has_unique_role_assignments.assert_called_once_with(
+                site["webUrl"], SITE_LIST_ONE_NAME
+            )
+            patch_sharepoint_client.site_list_role_assignments.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_get_docs_skips_sharepoint_home_cache_list(
+        self, patch_sharepoint_client
+    ):
+        patch_sharepoint_client.site_lists = AsyncIterator(
+            [
+                {
+                    "id": SITE_LIST_ONE_ID,
+                    "name": SITE_LIST_ONE_NAME,
+                    "lastModifiedDateTime": self.day_ago,
+                },
+                {
+                    "id": SHAREPOINT_HOME_CACHE_LIST_ID,
+                    "name": SHAREPOINT_HOME_CACHE_LIST_NAME,
+                    "lastModifiedDateTime": self.day_ago,
+                },
+            ]
+        )
+        attachment_list_titles = []
+
+        async def attachments_spy(site_web_url, list_title, list_item_id):
+            attachment_list_titles.append(list_title)
+            for attachment in self.site_list_item_attachments:
+                yield attachment
+
+        patch_sharepoint_client.site_list_item_attachments = attachments_spy
+
+        async with create_spo_source() as source:
+            source._dls_enabled = Mock(return_value=False)
+
+            results = []
+            async for doc, _download_func in source.get_docs():
+                results.append(doc)
+
+            site_list_names = [
+                doc["name"] for doc in results if doc.get("object_type") == "site_list"
+            ]
+            assert site_list_names == [SITE_LIST_ONE_NAME]
+            assert SHAREPOINT_HOME_CACHE_LIST_NAME not in attachment_list_titles
+            assert SITE_LIST_ONE_NAME in attachment_list_titles
+            # Same document set as sync without the excluded system list
+            assert len(results) == 11
 
     @pytest.mark.asyncio
     async def test_site_lists_with_unique_role_assignments(
@@ -3257,6 +3492,102 @@ class TestSharepointOnlineDataSource:
                 assert "_attachment" not in download_result
 
     @pytest.mark.asyncio
+    async def test_get_attachment_with_markdown_conversion_enabled(
+        self, patch_sharepoint_client
+    ):
+        attachment = {"odata.id": "1", "_original_filename": "file.pdf"}
+        message = "This is the text content of drive item"
+
+        async def download_func(attachment_id, async_buffer):
+            await async_buffer.write(bytes(message, "utf-8"))
+
+        patch_sharepoint_client.download_attachment = download_func
+        async with create_spo_source(use_markdown_conversion=True) as source:
+            source._markdown_client = AsyncMock()
+            source._markdown_client.stats = (1, 0, 0)
+            source._markdown_client.convert_file = AsyncMock(return_value="# Heading")
+
+            download_result = await source.get_attachment_content(attachment, doit=True)
+
+            source._markdown_client.convert_file.assert_awaited_once()
+            assert download_result["body"] == "# Heading"
+            assert "_attachment" not in download_result
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "markdown",
+        ["<!-- image -->\n\n<!-- image -->", ""],
+        ids=["placeholders_only", "conversion_failed"],
+    )
+    async def test_markdown_conversion_without_text_marks_document(
+        self, patch_sharepoint_client, markdown
+    ):
+        # A scanned PDF converts into image placeholders alone while OCR is off,
+        # and a failed conversion returns "". Neither is content: the body must
+        # not carry the placeholders, and the document has to stay findable so
+        # it can be re-extracted once OCR is available.
+        attachment = {"odata.id": "1", "_original_filename": "scan.pdf"}
+
+        async def download_func(attachment_id, async_buffer):
+            await async_buffer.write(b"%PDF-1.4 scanned")
+
+        patch_sharepoint_client.download_attachment = download_func
+        async with create_spo_source(use_markdown_conversion=True) as source:
+            source._markdown_client = AsyncMock()
+            source._markdown_client.stats = (1, 0, 0)
+            source._markdown_client.convert_file = AsyncMock(return_value=markdown)
+
+            download_result = await source.get_attachment_content(attachment, doit=True)
+
+            assert download_result["body"] == ""
+            assert download_result[EXTRACTION_STATE_FIELD] == UNEXTRACTED_STATE
+
+    @pytest.mark.asyncio
+    async def test_markdown_conversion_with_text_is_not_marked(
+        self, patch_sharepoint_client
+    ):
+        attachment = {"odata.id": "1", "_original_filename": "report.pdf"}
+
+        async def download_func(attachment_id, async_buffer):
+            await async_buffer.write(b"%PDF-1.4 born digital")
+
+        patch_sharepoint_client.download_attachment = download_func
+        async with create_spo_source(use_markdown_conversion=True) as source:
+            source._markdown_client = AsyncMock()
+            source._markdown_client.stats = (1, 0, 0)
+            source._markdown_client.convert_file = AsyncMock(
+                return_value="<!-- image -->\n\nReal text under the figure"
+            )
+
+            download_result = await source.get_attachment_content(attachment, doit=True)
+
+            assert "Real text" in download_result["body"]
+            assert EXTRACTION_STATE_FIELD not in download_result
+
+    @pytest.mark.asyncio
+    async def test_markdown_conversion_falls_through_for_unconvertible_file(
+        self, patch_sharepoint_client
+    ):
+        # .ppt cannot be converted, so it must still reach the base64 attachment
+        # path rather than being indexed with an empty body.
+        attachment = {"odata.id": "1", "_original_filename": "file.ppt"}
+        message = "This is the text content of drive item"
+
+        async def download_func(attachment_id, async_buffer):
+            await async_buffer.write(bytes(message, "utf-8"))
+
+        patch_sharepoint_client.download_attachment = download_func
+        async with create_spo_source(use_markdown_conversion=True) as source:
+            source._markdown_client = AsyncMock()
+            source._markdown_client.stats = (0, 0, 0)
+
+            download_result = await source.get_attachment_content(attachment, doit=True)
+
+            source._markdown_client.convert_file.assert_not_awaited()
+            assert "_attachment" in download_result
+            assert "body" not in download_result
+
+    @pytest.mark.asyncio
     @patch(
         "connectors_sdk.content_extraction.ContentExtraction._check_configured",
         lambda *_: False,
@@ -3429,6 +3760,28 @@ class TestSharepointOnlineDataSource:
 
             assert _prefix_user(USER_ONE_EMAIL) in access_control
             assert _prefix_email(USER_TWO_EMAIL) in access_control
+
+    @pytest.mark.asyncio
+    async def test_site_access_control_permissions_missing_raises_actionable_error(
+        self, patch_sharepoint_client
+    ):
+        # Regression test for https://github.com/elastic/connectors/issues/3293
+        # Reading role assignments over the SharePoint REST API requires
+        # "Sites.FullControl.All". When it is missing (e.g. certificate auth), the
+        # sync must fail with a clear, actionable error rather than a generic one.
+        async with create_spo_source(use_document_level_security=True) as source:
+            patch_sharepoint_client._validate_sharepoint_rest_url = Mock()
+            patch_sharepoint_client.site_role_assignments = Mock(
+                side_effect=PermissionsMissing()
+            )
+
+            site = {"id": 1, "webUrl": "some url"}
+
+            with pytest.raises(PermissionsMissing) as e:
+                await source._site_access_control(site)
+
+            assert "Sites.FullControl.All" in str(e.value)
+            assert "Document Level Security" in str(e.value)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

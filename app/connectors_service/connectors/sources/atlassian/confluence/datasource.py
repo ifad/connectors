@@ -9,6 +9,7 @@ import asyncio
 import os
 from copy import copy
 from functools import partial
+from typing import NamedTuple
 
 from connectors_sdk.source import BaseDataSource, ConfigurableFieldValueError
 from connectors_sdk.utils import (
@@ -17,14 +18,18 @@ from connectors_sdk.utils import (
 )
 
 from connectors.access_control import ACCESS_CONTROL
-from connectors.sources.atlassian.confluence.client import ConfluenceClient
+from connectors.sources.atlassian.confluence.client import (
+    ConfluenceClient,
+    ContentRestrictionFetchError,
+)
 from connectors.sources.atlassian.confluence.constants import (
     BLOGPOST,
     CONFLUENCE_CLOUD,
     CONFLUENCE_DATA_CENTER,
     CONFLUENCE_SERVER,
     CONTENT,
-    CONTENT_QUERY,
+    CONTENT_QUERY_CLOUD,
+    CONTENT_QUERY_DATA_CENTER,
     END_SIGNAL,
     MAX_CONCURRENCY,
     MAX_CONCURRENT_DOWNLOADS,
@@ -33,7 +38,8 @@ from connectors.sources.atlassian.confluence.constants import (
     QUEUE_SIZE,
     SPACE,
     SPACE_PERMISSION,
-    SPACE_QUERY,
+    SPACE_QUERY_CLOUD,
+    SPACE_QUERY_DATA_CENTER,
     URLS,
     USER,
     USER_QUERY,
@@ -56,6 +62,17 @@ from connectors.utils import (
     MemQueue,
     html_to_text,
 )
+
+
+class EffectiveReadAccess(NamedTuple):
+    """Resolved view ACL for a page.
+
+    When use_space is True, fall back to space permissions.
+    When use_space is False, identities is the ACL to index (may be empty).
+    """
+
+    identities: set
+    use_space: bool
 
 
 class ConfluenceDataSource(BaseDataSource):
@@ -462,6 +479,52 @@ class ConfluenceDataSource(BaseDataSource):
 
         return identities
 
+    async def _resolve_effective_read_access(
+        self, child_restrictions, ancestors, extract_identities
+    ):
+        """Resolve effective view ACL from child + ancestor explicit restrictions.
+
+        Returns EffectiveReadAccess. use_space is True only when every layer was
+        successfully evaluated and none had explicit view restrictions.
+        On ambiguous ancestor fetch failure, returns empty identities and
+        use_space=False (fail closed for DLS).
+        """
+        if not self._dls_enabled():
+            return EffectiveReadAccess(identities=set(), use_space=False)
+
+        layers = []
+        child_identities = extract_identities(response=child_restrictions)
+        if child_identities:
+            layers.append(child_identities)
+
+        for ancestor in ancestors or []:
+            ancestor_id = ancestor.get("id")
+            if not ancestor_id:
+                continue
+
+            try:
+                restrictions = await self.confluence_client.fetch_content_restrictions(
+                    content_id=ancestor_id
+                )
+            except ContentRestrictionFetchError:
+                return EffectiveReadAccess(identities=set(), use_space=False)
+
+            if restrictions is None:
+                continue
+
+            identities = extract_identities(
+                response=restrictions.get("restrictions", {})
+            )
+            if identities:
+                layers.append(identities)
+
+        if not layers:
+            return EffectiveReadAccess(identities=set(), use_space=True)
+
+        return EffectiveReadAccess(
+            identities=set.intersection(*layers), use_space=False
+        )
+
     async def close(self):
         """Closes unclosed client session"""
         await self.confluence_client.close_session()
@@ -492,8 +555,13 @@ class ConfluenceDataSource(BaseDataSource):
         if self.spaces == [WILDCARD]:
             return
         space_keys = []
+        api_query = (
+            SPACE_QUERY_CLOUD
+            if self.confluence_client.data_source_type == CONFLUENCE_CLOUD
+            else SPACE_QUERY_DATA_CENTER
+        )
         async for response in self.confluence_client.paginated_api_call(
-            url_name=SPACE, api_query=SPACE_QUERY
+            url_name=SPACE, api_query=api_query
         ):
             spaces = response.get("results", [])
             space_keys.extend([space.get("key", "") for space in spaces])
@@ -540,6 +608,7 @@ class ConfluenceDataSource(BaseDataSource):
             Integer: Number of attachments in a page/blogpost
             List: List of permissions attached to document
             Dictionary: Dictionary of restrictions attached to document
+            List: List of ancestors (with their ids) of the document
         """
         async for (
             document,
@@ -585,6 +654,7 @@ class ConfluenceDataSource(BaseDataSource):
                 document.get("restrictions", {})
                 .get("read", {})
                 .get("restrictions", {}),
+                document.get("ancestors", []),
             )
 
     async def fetch_attachments(
@@ -835,14 +905,22 @@ class ConfluenceDataSource(BaseDataSource):
                 space_key,
                 permissions,
                 restrictions,
+                ancestors,
             ) in self.fetch_documents(api_query):
                 # Pages and blog posts are open to viewing or editing by default,
                 # but you can restrict either viewing or editing to certain users or groups.
                 if self.confluence_client.data_source_type == CONFLUENCE_CLOUD:
-                    access_control = list(
-                        self._extract_identities(response=restrictions)
-                    )
-                    if len(access_control) == 0:
+                    extract_identities = self._extract_identities
+                else:
+                    extract_identities = self._extract_identities_for_datacenter
+
+                effective_access = await self._resolve_effective_read_access(
+                    child_restrictions=restrictions,
+                    ancestors=ancestors,
+                    extract_identities=extract_identities,
+                )
+                if effective_access.use_space:
+                    if self.confluence_client.data_source_type == CONFLUENCE_CLOUD:
                         # Every space has its own independent set of permissions, managed by the space admin(s),
                         # which determine the access settings for different users and groups.
                         access_control = list(
@@ -850,11 +928,7 @@ class ConfluenceDataSource(BaseDataSource):
                                 permissions=permissions, target_type=target_type
                             )
                         )
-                else:
-                    access_control = list(
-                        self._extract_identities_for_datacenter(response=restrictions)
-                    )
-                    if len(access_control) == 0:
+                    else:
                         permission = await self.fetch_server_space_permission(
                             space_key=space_key
                         )
@@ -865,6 +939,8 @@ class ConfluenceDataSource(BaseDataSource):
                                 )
                             )
                         )
+                else:
+                    access_control = list(effective_access.identities)
                 document = self._decorate_with_access_control(
                     document=document, access_control=access_control
                 )
@@ -923,6 +999,11 @@ class ConfluenceDataSource(BaseDataSource):
                         yield document, None
 
         else:
+            content_query = (
+                CONTENT_QUERY_CLOUD
+                if self.confluence_client.data_source_type == CONFLUENCE_CLOUD
+                else CONTENT_QUERY_DATA_CENTER
+            )
             async for space in self._space_coro():
                 yield space, None
                 self._logger.info(f"Fetching docs from space: {space['key']}")
@@ -930,14 +1011,14 @@ class ConfluenceDataSource(BaseDataSource):
                 await self.fetchers.put(
                     partial(
                         self._page_blog_coro,
-                        f"{configured_spaces_query}{BLOGPOST}&{CONTENT_QUERY}",
+                        f"{configured_spaces_query}{BLOGPOST}&{content_query}",
                         BLOGPOST,
                     )
                 )
                 await self.fetchers.put(
                     partial(
                         self._page_blog_coro,
-                        f"{configured_spaces_query}{PAGE}&{CONTENT_QUERY}",
+                        f"{configured_spaces_query}{PAGE}&{content_query}",
                         PAGE,
                     )
                 )

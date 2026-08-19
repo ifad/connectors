@@ -25,18 +25,30 @@ from connectors.access_control import (
 )
 from connectors.es.sink import OP_DELETE, OP_INDEX
 from connectors.sources.sharepoint.sharepoint_online.client import (
+    PermissionsMissing,
     SharepointOnlineClient,
 )
 from connectors.sources.sharepoint.sharepoint_online.constants import (
     CURSOR_SITE_DRIVE_KEY,
+    EXCLUDED_SHAREPOINT_LIST_NAMES,
+    EXTRACTION_STATE_FIELD,
+    IGNORED_EXTENSIONS,
     MAX_DOCUMENT_SIZE,
     SPO_API_MAX_BATCH_SIZE,
     SPO_MAX_EXPAND_SIZE,
     TIMESTAMP_FORMAT,
+    UNEXTRACTED_STATE,
     VIEW_ITEM_MASK,
     VIEW_PAGE_MASK,
     VIEW_ROLE_TYPES,
     WILDCARD,
+)
+from connectors.sources.sharepoint.sharepoint_online.convert_markdown_client import (
+    DEFAULT_BASE_URL,
+    ConvertMarkdownClient,
+)
+from connectors.sources.sharepoint.sharepoint_online.sharepoint_metadata_enricher import (
+    SharePointMetadataEnricher,
 )
 from connectors.sources.sharepoint.sharepoint_online.utils import (
     SyncCursorEmpty,
@@ -67,9 +79,37 @@ class SharepointOnlineDataSource(BaseDataSource):
 
         self._client = None
         self.site_group_cache = {}
+        self._metadata_enricher = None
+        self._markdown_client = None
 
     def _set_internal_logger(self):
         self.client.set_logger(self._logger)
+        # Initialize metadata enricher with logger and graph api client
+        self._metadata_enricher = SharePointMetadataEnricher(
+            logger=self._logger,
+            graph_api_client=self.client._graph_api_client,
+        )
+        if self._markdown_client is not None:
+            self._markdown_client.set_logger(self._logger)
+
+    @property
+    def metadata_enricher(self):
+        if not self._metadata_enricher:
+            self._metadata_enricher = SharePointMetadataEnricher(
+                logger=self._logger,
+                graph_api_client=self.client._graph_api_client,
+            )
+        return self._metadata_enricher
+
+    @property
+    def markdown_client(self):
+        if not self._markdown_client:
+            self._markdown_client = ConvertMarkdownClient(
+                base_url=self.configuration["convert_markdown_base_url"],
+                convert_timeout=self.configuration["convert_markdown_timeout"],
+                logger_=self._logger,
+            )
+        return self._markdown_client
 
     @property
     def client(self):
@@ -231,6 +271,44 @@ class SharepointOnlineDataSource(BaseDataSource):
                 "type": "bool",
                 "value": True,
             },
+            "enrich_metadata": {
+                "display": "toggle",
+                "label": "Enrich documents with metadata",
+                "order": 17,
+                "tooltip": "Enable this option to enrich all documents with structured metadata including category, division, content type, and other SharePoint managed properties. The metadata will be stored as an array of key-value pairs in a 'metadata' field.",
+                "type": "bool",
+                "value": True,
+                "ui_restrictions": ["advanced"],
+            },
+            "use_markdown_conversion": {
+                "display": "toggle",
+                "label": "Convert documents to Markdown",
+                "order": 18,
+                "tooltip": "Requires a separate deployment of the convert-markdown service. Converts PDF and Office documents to Markdown with table structure preserved, instead of extracting plain text. Requires that pipeline settings disable text extraction.",
+                "type": "bool",
+                "ui_restrictions": ["advanced"],
+                "value": False,
+            },
+            "convert_markdown_base_url": {
+                "depends_on": [{"field": "use_markdown_conversion", "value": True}],
+                "label": "Convert-markdown service URL",
+                "order": 19,
+                "tooltip": "Root URL of the convert-markdown service, e.g. http://convert-markdown:8000",
+                "type": "str",
+                "ui_restrictions": ["advanced"],
+                "value": DEFAULT_BASE_URL,
+            },
+            "convert_markdown_timeout": {
+                "depends_on": [{"field": "use_markdown_conversion", "value": True}],
+                "display": "numeric",
+                "label": "Conversion timeout (seconds)",
+                "order": 20,
+                "tooltip": "How long to wait for a single document to be converted. Conversion is CPU-bound and takes seconds per page, so a large document can run for tens of minutes.",
+                "type": "int",
+                "ui_restrictions": ["advanced"],
+                "validations": [{"type": "greater_than", "constraint": 0}],
+                "value": 3600,
+            },
         }
 
     async def validate_config(self):
@@ -293,6 +371,19 @@ class SharepointOnlineDataSource(BaseDataSource):
 
         return document
 
+    def _enrich_document_with_metadata(
+        self, document, site=None, site_drive=None, site_list=None
+    ):
+        """Enrich document with metadata using the dedicated metadata enricher."""
+        enrich_enabled = bool(self.configuration.get("enrich_metadata", True))
+        return self.metadata_enricher.enrich_document_with_metadata(
+            document=document,
+            site=site,
+            site_drive=site_drive,
+            site_list=site_list,
+            enrich_metadata_enabled=enrich_enabled,
+        )
+
     async def _site_access_control(self, site):
         """Fetches all permissions for all owners, members and visitors of a given site.
         All groups and/or persons, which have permissions for a given site are returned with their given identity prefix ("user", "group" or "email").
@@ -323,25 +414,39 @@ class SharepointOnlineDataSource(BaseDataSource):
         access_control = set()
         site_admins_access_control = set()
 
-        async for role_assignment in self.client.site_role_assignments(site["webUrl"]):
-            member = role_assignment["Member"]
-            member_access_control = set()
-            member_access_control.update(
-                await self._get_access_control_from_role_assignment(role_assignment)
+        try:
+            async for role_assignment in self.client.site_role_assignments(
+                site["webUrl"]
+            ):
+                member = role_assignment["Member"]
+                member_access_control = set()
+                member_access_control.update(
+                    await self._get_access_control_from_role_assignment(role_assignment)
+                )
+
+                if _is_site_admin(member):
+                    # These are likely in the "Owners" group for the site
+                    site_admins_access_control |= member_access_control
+
+                access_control |= member_access_control
+
+            # This fetches the "Site Collection Administrators", which is distinct from the "Owners" group of the site
+            # however, both should have access to everything in the site, regardless of unique role assignments
+            async for member in self.client.site_admins(site["webUrl"]):
+                site_admins_access_control.update(
+                    await self._access_control_for_member(member)
+                )
+        except PermissionsMissing as e:
+            # Fail with an actionable error instead of the generic "unauthorized".
+            msg = (
+                f"Cannot read access control for site '{site['webUrl']}', required "
+                "for Document Level Security. Reading SharePoint role assignments "
+                "requires the 'Sites.FullControl.All' SharePoint application "
+                "permission. Grant it to the App Registration (required for "
+                "certificate / Entra ID app-only authentication), or disable "
+                "Document Level Security if per-document permissions are not needed."
             )
-
-            if _is_site_admin(member):
-                # These are likely in the "Owners" group for the site
-                site_admins_access_control |= member_access_control
-
-            access_control |= member_access_control
-
-        # This fetches the "Site Collection Administrators", which is distinct from the "Owners" group of the site
-        # however, both should have access to everything in the site, regardless of unique role assignments
-        async for member in self.client.site_admins(site["webUrl"]):
-            site_admins_access_control.update(
-                await self._access_control_for_member(member)
-            )
+            raise PermissionsMissing(msg) from e
 
         return list(access_control), list(site_admins_access_control)
 
@@ -579,6 +684,8 @@ class SharepointOnlineDataSource(BaseDataSource):
             max_drive_item_age = advanced_rules["skipExtractingDriveItemsOlderThan"]
 
         async for site_collection in self.site_collections():
+            # Enrich site collection with metadata
+            site_collection = self._enrich_document_with_metadata(site_collection)
             yield site_collection, None
 
             async for site in self.sites(
@@ -590,32 +697,79 @@ class SharepointOnlineDataSource(BaseDataSource):
                     site_admin_access_control,
                 ) = await self._site_access_control(site)
 
+                # Enrich site with metadata and access control
+                enriched_site = self._enrich_document_with_metadata(site)
+                enriched_site = self._decorate_with_access_control(
+                    enriched_site, site_access_control
+                )
                 yield (
-                    self._decorate_with_access_control(site, site_access_control),
+                    enriched_site,
                     None,
                 )
 
                 async for site_drive in self.site_drives(site):
+                    # Enrich site drive with metadata and access control
+                    enriched_site_drive = self._enrich_document_with_metadata(
+                        site_drive, site=site, site_drive=site_drive
+                    )
+                    enriched_site_drive = self._decorate_with_access_control(
+                        enriched_site_drive, site_access_control
+                    )
                     yield (
-                        self._decorate_with_access_control(
-                            site_drive, site_access_control
-                        ),
+                        enriched_site_drive,
                         None,
                     )
 
-                    async for page in self.client.drive_items(site_drive["id"]):
+                    async for page in self.client.drive_items(
+                        site_drive["id"],
+                        site=site,
+                        metadata_enricher=self.metadata_enricher,
+                    ):
                         for drive_items_batch in iterable_batches_generator(
                             page.items, SPO_API_MAX_BATCH_SIZE
                         ):
+                            # One $batch round-trip for the whole page-batch. The
+                            # per-item call this replaces was awaited inside the
+                            # loop below, so it stalled this generator — and with
+                            # it every download and conversion downstream — once
+                            # per document.
+                            list_fields = {}
+                            if self.configuration.get("enrich_metadata", True):
+                                list_fields = await self.metadata_enricher.get_drive_item_list_fields_batch(
+                                    site_drive["id"],
+                                    [
+                                        item["id"]
+                                        for item in drive_items_batch
+                                        if item.get("id")
+                                        and not self.is_ignored_file(
+                                            item.get("name", "")
+                                        )
+                                    ],
+                                )
+
                             async for (
                                 drive_item
                             ) in self._drive_items_batch_with_permissions(
                                 site_drive["id"], drive_items_batch, site["webUrl"]
                             ):
+                                if self.is_ignored_file(drive_item.get("name", "")):
+                                    continue
+
                                 drive_item["_id"] = drive_item["id"]
                                 drive_item["object_type"] = "drive_item"
                                 drive_item["_timestamp"] = drive_item.get(
                                     "lastModifiedDateTime"
+                                )
+
+                                # Enrich drive item with SharePoint list metadata
+                                if self.configuration.get("enrich_metadata", True):
+                                    drive_item = self.metadata_enricher.apply_list_metadata(
+                                        drive_item,
+                                        list_fields.get(drive_item.get("id")),
+                                    )
+                                # Enrich with metadata
+                                drive_item = self._enrich_document_with_metadata(
+                                    drive_item, site=site, site_drive=site_drive
                                 )
 
                                 # Drive items should inherit site access controls only if
@@ -681,6 +835,8 @@ class SharepointOnlineDataSource(BaseDataSource):
             max_drive_item_age = advanced_rules["skipExtractingDriveItemsOlderThan"]
 
         async for site_collection in self.site_collections():
+            # Enrich site collection with metadata
+            site_collection = self._enrich_document_with_metadata(site_collection)
             yield site_collection, None, OP_INDEX
 
             async for site in self.sites(
@@ -693,8 +849,13 @@ class SharepointOnlineDataSource(BaseDataSource):
                     site_admin_access_control,
                 ) = await self._site_access_control(site)
 
+                # Enrich site with metadata and access control
+                enriched_site = self._enrich_document_with_metadata(site)
+                enriched_site = self._decorate_with_access_control(
+                    enriched_site, site_access_control
+                )
                 yield (
-                    self._decorate_with_access_control(site, site_access_control),
+                    enriched_site,
                     None,
                     OP_INDEX,
                 )
@@ -703,10 +864,15 @@ class SharepointOnlineDataSource(BaseDataSource):
                 # lastModifiedDateTime of the parent site_drive. Therefore, we
                 # set check_timestamp to False when iterating over site_drives.
                 async for site_drive in self.site_drives(site, check_timestamp=False):
+                    # Enrich site drive with metadata and access control
+                    enriched_site_drive = self._enrich_document_with_metadata(
+                        site_drive, site=site, site_drive=site_drive
+                    )
+                    enriched_site_drive = self._decorate_with_access_control(
+                        enriched_site_drive, site_access_control
+                    )
                     yield (
-                        self._decorate_with_access_control(
-                            site_drive, site_access_control
-                        ),
+                        enriched_site_drive,
                         None,
                         OP_INDEX,
                     )
@@ -714,20 +880,57 @@ class SharepointOnlineDataSource(BaseDataSource):
                     delta_link = self.get_drive_delta_link(site_drive["id"])
 
                     async for page in self.client.drive_items(
-                        drive_id=site_drive["id"], url=delta_link
+                        drive_id=site_drive["id"],
+                        url=delta_link,
+                        site=site,
+                        metadata_enricher=self.metadata_enricher,
+                        resume_from=self.last_sync_time(),
                     ):
                         for drive_items_batch in iterable_batches_generator(
                             page.items, SPO_API_MAX_BATCH_SIZE
                         ):
+                            # One $batch round-trip for the whole page-batch. The
+                            # per-item call this replaces was awaited inside the
+                            # loop below, so it stalled this generator — and with
+                            # it every download and conversion downstream — once
+                            # per document.
+                            list_fields = {}
+                            if self.configuration.get("enrich_metadata", True):
+                                list_fields = await self.metadata_enricher.get_drive_item_list_fields_batch(
+                                    site_drive["id"],
+                                    [
+                                        item["id"]
+                                        for item in drive_items_batch
+                                        if item.get("id")
+                                        and not self.is_ignored_file(
+                                            item.get("name", "")
+                                        )
+                                    ],
+                                )
+
                             async for (
                                 drive_item
                             ) in self._drive_items_batch_with_permissions(
                                 site_drive["id"], drive_items_batch, site["webUrl"]
                             ):
+                                if self.is_ignored_file(drive_item.get("name", "")):
+                                    continue
+
                                 drive_item["_id"] = drive_item["id"]
                                 drive_item["object_type"] = "drive_item"
                                 drive_item["_timestamp"] = drive_item.get(
                                     "lastModifiedDateTime"
+                                )
+
+                                # Enrich drive item with SharePoint list metadata
+                                if self.configuration.get("enrich_metadata", True):
+                                    drive_item = self.metadata_enricher.apply_list_metadata(
+                                        drive_item,
+                                        list_fields.get(drive_item.get("id")),
+                                    )
+                                # Enrich with metadata
+                                drive_item = self._enrich_document_with_metadata(
+                                    drive_item, site=site, site_drive=site_drive
                                 )
 
                                 # Drive items should inherit site access controls only if
@@ -927,12 +1130,24 @@ class SharepointOnlineDataSource(BaseDataSource):
 
         return self._decorate_with_access_control(drive_item, access_control)
 
-    async def drive_items(self, site_drive, max_drive_item_age):
-        async for page in self.client.drive_items(site_drive["id"]):
+    async def drive_items(self, site_drive, max_drive_item_age, site=None):
+        async for page in self.client.drive_items(
+            site_drive["id"],
+            site=site,
+            metadata_enricher=self.metadata_enricher,
+        ):
             for drive_item in page:
+                if self.is_ignored_file(drive_item.get("name", "")):
+                    continue
+
                 drive_item["_id"] = drive_item["id"]
                 drive_item["object_type"] = "drive_item"
                 drive_item["_timestamp"] = drive_item["lastModifiedDateTime"]
+
+                # Enrich with metadata
+                drive_item = self._enrich_document_with_metadata(
+                    drive_item, site=site, site_drive=site_drive
+                )
 
                 yield drive_item, self.download_function(drive_item, max_drive_item_age)
 
@@ -1043,15 +1258,37 @@ class SharepointOnlineDataSource(BaseDataSource):
                                 ACCESS_CONTROL, []
                             )
 
+                        # Enrich attachment with metadata before yielding
+                        list_item_attachment = self._enrich_document_with_metadata(
+                            list_item_attachment,
+                            site=site,
+                            site_list={"id": site_list_id, "name": site_list_name},
+                        )
+
                         attachment_download_func = partial(
                             self.get_attachment_content, list_item_attachment
                         )
                         yield list_item_attachment, attachment_download_func
 
+                # Enrich list item with metadata before yielding
+                list_item = self._enrich_document_with_metadata(
+                    list_item,
+                    site=site,
+                    site_list={"id": site_list_id, "name": site_list_name},
+                )
+
                 yield list_item, None
 
     async def site_lists(self, site, site_access_control, check_timestamp=False):
         async for site_list in self.client.site_lists(site["id"]):
+            site_list_name = site_list.get("name")
+            if site_list_name in EXCLUDED_SHAREPOINT_LIST_NAMES:
+                self._logger.debug(
+                    f"Skipping excluded SharePoint list '{site_list_name}' "
+                    f"on site '{site.get('webUrl', site.get('id'))}'"
+                )
+                continue
+
             if not check_timestamp or (
                 check_timestamp
                 and site_list["lastModifiedDateTime"] >= self.last_sync_time()
@@ -1059,7 +1296,6 @@ class SharepointOnlineDataSource(BaseDataSource):
                 site_list["_id"] = site_list["id"]
                 site_list["object_type"] = "site_list"
                 site_url = site["webUrl"]
-                site_list_name = site_list["name"]
 
                 has_unique_role_assignments = False
 
@@ -1099,6 +1335,11 @@ class SharepointOnlineDataSource(BaseDataSource):
                     site_list = self._decorate_with_access_control(
                         site_list, site_access_control
                     )
+
+                # Enrich site list with metadata before yielding
+                site_list = self._enrich_document_with_metadata(
+                    site_list, site=site, site_list=site_list
+                )
 
                 yield site_list
 
@@ -1235,6 +1476,9 @@ class SharepointOnlineDataSource(BaseDataSource):
                     if html_field in site_page:
                         site_page[html_field] = html_to_text(site_page[html_field])
 
+                # Enrich site page with metadata before yielding
+                site_page = self._enrich_document_with_metadata(site_page, site=site)
+
                 yield site_page
 
     def init_sync_cursor(self):
@@ -1279,7 +1523,7 @@ class SharepointOnlineDataSource(BaseDataSource):
 
         if "@microsoft.graph.downloadUrl" not in drive_item:
             self._logger.debug(
-                f"Not downloading file {drive_item['name']}: field \"@microsoft.graph.downloadUrl\" is missing"
+                f'Not downloading file {drive_item["name"]}: field "@microsoft.graph.downloadUrl" is missing'
             )
             return None
 
@@ -1291,7 +1535,7 @@ class SharepointOnlineDataSource(BaseDataSource):
 
         if "lastModifiedDateTime" not in drive_item:
             self._logger.debug(
-                f"Not downloading file {drive_item['name']}: field \"lastModifiedDateTime\" is missing"
+                f'Not downloading file {drive_item["name"]}: field "lastModifiedDateTime" is missing'
             )
             return None
 
@@ -1307,9 +1551,9 @@ class SharepointOnlineDataSource(BaseDataSource):
             )
 
             return None
-        elif (
-            drive_item["size"] > MAX_DOCUMENT_SIZE
-            and not self.configuration["use_text_extraction_service"]
+        elif drive_item["size"] > MAX_DOCUMENT_SIZE and not (
+            self.configuration["use_text_extraction_service"]
+            or self.configuration["use_markdown_conversion"]
         ):
             self._logger.warning(
                 f"Not downloading file {drive_item['name']} of size {drive_item['size']}"
@@ -1349,7 +1593,7 @@ class SharepointOnlineDataSource(BaseDataSource):
             "_timestamp": new_timestamp,
         }
 
-        attached_file, body = await self._download_content(
+        attached_file, body, extraction_state = await self._download_content(
             partial(self.client.download_attachment, attachment["odata.id"]),
             attachment["_original_filename"],
         )
@@ -1359,6 +1603,8 @@ class SharepointOnlineDataSource(BaseDataSource):
         if body is not None:
             # accept empty strings for body
             doc["body"] = body
+        if extraction_state:
+            doc[EXTRACTION_STATE_FIELD] = extraction_state
 
         return doc
 
@@ -1368,9 +1614,9 @@ class SharepointOnlineDataSource(BaseDataSource):
         if not (doit and document_size):
             return
 
-        if (
-            document_size > MAX_DOCUMENT_SIZE
-            and not self.configuration["use_text_extraction_service"]
+        if document_size > MAX_DOCUMENT_SIZE and not (
+            self.configuration["use_text_extraction_service"]
+            or self.configuration["use_markdown_conversion"]
         ):
             return
 
@@ -1379,7 +1625,7 @@ class SharepointOnlineDataSource(BaseDataSource):
             "_timestamp": drive_item["lastModifiedDateTime"],
         }
 
-        attached_file, body = await self._download_content(
+        attached_file, body, extraction_state = await self._download_content(
             partial(
                 self.client.download_drive_item,
                 drive_item["parentReference"]["driveId"],
@@ -1393,12 +1639,15 @@ class SharepointOnlineDataSource(BaseDataSource):
         if body is not None:
             # accept empty strings for body
             doc["body"] = body
+        if extraction_state:
+            doc[EXTRACTION_STATE_FIELD] = extraction_state
 
         return doc
 
     async def _download_content(self, download_func, original_filename):
         attachment = None
         body = None
+        extraction_state = None
         source_file_name = ""
         file_extension = os.path.splitext(original_filename)[-1].lower()
 
@@ -1414,7 +1663,24 @@ class SharepointOnlineDataSource(BaseDataSource):
                 # This way async_buffer will be passed from here!!!
                 await download_func(async_buffer)
 
-            if self.configuration["use_text_extraction_service"]:
+            # Only formats convert-markdown can parse go to it; anything else
+            # falls through to the existing paths rather than being indexed with
+            # an empty body.
+            if self.configuration[
+                "use_markdown_conversion"
+            ] and ConvertMarkdownClient.is_convertible(original_filename):
+                body = await self.markdown_client.convert_file(
+                    source_file_name, original_filename
+                )
+                if ConvertMarkdownClient.yielded_no_text(body):
+                    # A scanned PDF converts to nothing but image placeholders
+                    # while OCR is off, and a failed conversion returns "".
+                    # Neither is content, so drop it and mark the document
+                    # instead — an empty body on its own cannot be told apart
+                    # from a genuinely empty file when it is time to re-extract.
+                    body = ""
+                    extraction_state = UNEXTRACTED_STATE
+            elif self.configuration["use_text_extraction_service"]:
                 body = ""
                 if self.extraction_service._check_configured():
                     body = await self.extraction_service.extract_text(
@@ -1433,7 +1699,7 @@ class SharepointOnlineDataSource(BaseDataSource):
             if source_file_name:
                 await remove(str(source_file_name))
 
-        return attachment, body
+        return attachment, body, extraction_state
 
     async def ping(self):
         pass
@@ -1442,9 +1708,28 @@ class SharepointOnlineDataSource(BaseDataSource):
         await self.client.close()
         if self.extraction_service is not None:
             await self.extraction_service._end_session()
+        if self._markdown_client is not None:
+            attempts, failures, cache_hits = self._markdown_client.stats
+            if attempts:
+                self._logger.info(
+                    f"Markdown conversion: {attempts} attempted, {failures} failed, "
+                    f"{cache_hits} reused from cache"
+                )
+            await self._markdown_client.close()
 
     def advanced_rules_validators(self):
         return [SharepointOnlineAdvancedRulesValidator()]
+
+    def is_ignored_file(self, filename):
+        """Whether ``filename`` is a format we do not index at all.
+
+        Distinct from is_supported_format, which only decides whether to
+        download content: an unsupported file is still indexed as a
+        metadata-only record. These are dropped entirely.
+        """
+        if not filename:
+            return False
+        return os.path.splitext(filename)[-1].lower() in IGNORED_EXTENSIONS
 
     def is_supported_format(self, filename):
         if "." not in filename:
@@ -1452,6 +1737,13 @@ class SharepointOnlineDataSource(BaseDataSource):
 
         attachment_extension = os.path.splitext(filename)
         if attachment_extension[-1].lower() in TIKA_SUPPORTED_FILETYPES:
+            return True
+
+        # convert-markdown parses a few formats Tika is not configured for
+        # (notably .htm), so they are worth downloading when it is enabled.
+        if self.configuration[
+            "use_markdown_conversion"
+        ] and ConvertMarkdownClient.is_convertible(filename):
             return True
 
         return False

@@ -4,15 +4,38 @@
 # you may not use this file except in compliance with the Elastic License 2.0.
 #
 
-import os
 
 from connectors_sdk.logger import logger
 from envyaml import EnvYAML
 
+# --- Elasticsearch connection defaults -----------------------------------------------
+DEFAULT_ELASTICSEARCH_HOST = "http://localhost:9200"
+DEFAULT_ELASTICSEARCH_REQUEST_TIMEOUT = 240
+DEFAULT_ELASTICSEARCH_MAX_WAIT_DURATION = 240
+DEFAULT_ELASTICSEARCH_RETRY_ON_TIMEOUT = True
 DEFAULT_ELASTICSEARCH_MAX_RETRIES = 5
 DEFAULT_ELASTICSEARCH_RETRY_INTERVAL = 10
+DEFAULT_ELASTICSEARCH_INITIAL_BACKOFF_DURATION = 1
+DEFAULT_ELASTICSEARCH_BACKOFF_MULTIPLIER = 2
 
-DEFAULT_MAX_FILE_SIZE = 10485760  # 10MB
+# --- Elasticsearch bulk-ingest defaults ----------------------------------------------
+DEFAULT_QUEUE_MAX_SIZE = 1024
+DEFAULT_QUEUE_MAX_MEM_SIZE = 25
+DEFAULT_QUEUE_REFRESH_INTERVAL = 1
+# Sized for the default `elasticsearch.request_timeout` (240s) and the default
+# `elasticsearch.max_retries` / `elasticsearch.retry_interval` (5 attempts with linear
+# backoff): 5 × 240 + (10 + 20 + 30 + 40) = 1300s. If any of those defaults change,
+# this value must change too -- otherwise the mem-queue circuit breaker can fire
+# before the retry layer has exhausted its budget.
+DEFAULT_QUEUE_REFRESH_TIMEOUT = 1300
+DEFAULT_CHUNK_SIZE = 500
+DEFAULT_CHUNK_MAX_MEM_SIZE = 3
+DEFAULT_DISPLAY_EVERY = 100
+DEFAULT_MAX_CONCURRENCY = 5
+DEFAULT_CONCURRENT_DOWNLOADS = 10
+
+# --- File handling defaults ----------------------------------------------------------
+DEFAULT_MAX_FILE_SIZE = 10485760  # 10MiB
 
 
 def load_config(config_file):
@@ -22,7 +45,6 @@ def load_config(config_file):
     for key, value in yaml_config.items():
         _nest_configs(nested_yaml_config, key, value)
     configuration = dict(_merge_dicts(_default_config(), nested_yaml_config))
-    _ent_search_config(configuration)
 
     return configuration
 
@@ -34,48 +56,26 @@ def add_defaults(config, default_config=None):
     return configuration
 
 
-# Left - in Enterprise Search; Right - in Connectors
-config_mappings = {
-    "elasticsearch.host": "elasticsearch.host",
-    "elasticsearch.username": "elasticsearch.username",
-    "elasticsearch.password": "elasticsearch.password",
-    "elasticsearch.headers": "elasticsearch.headers",
-    "log_level": "service.log_level",
-}
-
-# Enterprise Search uses Ruby and is in lower case always, so hacking it here for now
-# Ruby-supported log levels: 'debug', 'info', 'warn', 'error', 'fatal', 'unknown'
-# Python-supported log levels: 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL', 'NOTSET'
-log_level_mappings = {
-    "debug": "DEBUG",
-    "info": "INFO",
-    "warn": "WARNING",
-    "error": "ERROR",
-    "fatal": "CRITICAL",
-    "unknown": "NOTSET",
-}
-
-
 def _default_config():
     return {
         "elasticsearch": {
-            "host": "http://localhost:9200",
+            "host": DEFAULT_ELASTICSEARCH_HOST,
             "username": "elastic",
             "password": "changeme",
             "ssl": True,
             "verify_certs": True,
             "bulk": {
-                "queue_max_size": 1024,
-                "queue_max_mem_size": 25,
-                "queue_refresh_interval": 1,
-                "queue_refresh_timeout": 600,
-                "display_every": 100,
-                "chunk_size": 1000,
-                "max_concurrency": 5,
-                "chunk_max_mem_size": 5,
+                "queue_max_size": DEFAULT_QUEUE_MAX_SIZE,
+                "queue_max_mem_size": DEFAULT_QUEUE_MAX_MEM_SIZE,
+                "queue_refresh_interval": DEFAULT_QUEUE_REFRESH_INTERVAL,
+                "queue_refresh_timeout": DEFAULT_QUEUE_REFRESH_TIMEOUT,
+                "display_every": DEFAULT_DISPLAY_EVERY,
+                "chunk_size": DEFAULT_CHUNK_SIZE,
+                "max_concurrency": DEFAULT_MAX_CONCURRENCY,
+                "chunk_max_mem_size": DEFAULT_CHUNK_MAX_MEM_SIZE,
                 "max_retries": DEFAULT_ELASTICSEARCH_MAX_RETRIES,
                 "retry_interval": DEFAULT_ELASTICSEARCH_RETRY_INTERVAL,
-                "concurrent_downloads": 10,
+                "concurrent_downloads": DEFAULT_CONCURRENT_DOWNLOADS,
                 "enable_operations_logging": False,
                 "error_monitor": {
                     "enabled": True,
@@ -88,11 +88,11 @@ def _default_config():
             },
             "max_retries": DEFAULT_ELASTICSEARCH_MAX_RETRIES,
             "retry_interval": DEFAULT_ELASTICSEARCH_RETRY_INTERVAL,
-            "retry_on_timeout": True,
-            "request_timeout": 120,
-            "max_wait_duration": 120,
-            "initial_backoff_duration": 1,
-            "backoff_multiplier": 2,
+            "retry_on_timeout": DEFAULT_ELASTICSEARCH_RETRY_ON_TIMEOUT,
+            "request_timeout": DEFAULT_ELASTICSEARCH_REQUEST_TIMEOUT,
+            "max_wait_duration": DEFAULT_ELASTICSEARCH_MAX_WAIT_DURATION,
+            "initial_backoff_duration": DEFAULT_ELASTICSEARCH_INITIAL_BACKOFF_DURATION,
+            "backoff_multiplier": DEFAULT_ELASTICSEARCH_BACKOFF_MULTIPLIER,
             "log_level": "info",
             "feature_use_connectors_api": True,
         },
@@ -145,29 +145,6 @@ def _default_config():
             "zoom": "connectors.sources.zoom:ZoomDataSource",
         },
     }
-
-
-def _ent_search_config(configuration):
-    if "ENT_SEARCH_CONFIG_PATH" not in os.environ:
-        return
-    logger.info("Found ENT_SEARCH_CONFIG_PATH, loading ent-search config")
-    ent_search_config = EnvYAML(os.environ["ENT_SEARCH_CONFIG_PATH"])
-    for es_field in config_mappings.keys():
-        if es_field not in ent_search_config:
-            continue
-
-        connector_field = config_mappings[es_field]
-        es_field_value = ent_search_config[es_field]
-
-        if es_field == "log_level":
-            if es_field_value not in log_level_mappings:
-                msg = f"Unexpected log level: {es_field_value}. Allowed values: {', '.join(log_level_mappings.keys())}"
-                raise ValueError(msg)
-            es_field_value = log_level_mappings[es_field_value]
-
-        _nest_configs(configuration, connector_field, es_field_value)
-
-        logger.debug(f"Overridden {connector_field}")
 
 
 def _nest_configs(configuration, field, value):

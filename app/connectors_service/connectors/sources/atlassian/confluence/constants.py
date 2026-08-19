@@ -15,13 +15,18 @@ ATTACHMENT = "attachment"
 CONTENT = "content"
 DOWNLOAD = "download"
 SEARCH = "search"
+CONTENT_RESTRICTION = "content_restriction"
 USER = "user"
 USERS_FOR_DATA_CENTER = "users_for_data_center"
 SEARCH_FOR_DATA_CENTER = "search_for_data_center"
 USERS_FOR_SERVER = "users_for_server"
-SPACE_QUERY = "limit=100&expand=permissions,history"
+SPACE_QUERY_CLOUD = "limit=100&expand=permissions,history"
+# DC/Server: drop expand=permissions,history (unused, and 500s per CONFSERVER-99908).
+SPACE_QUERY_DATA_CENTER = "limit=100"
 ATTACHMENT_QUERY = "limit=100&expand=version,history"
-CONTENT_QUERY = "limit=50&expand=ancestors,children.attachment,history.lastUpdated,body.storage,space,space.permissions,restrictions.read.restrictions.user,restrictions.read.restrictions.group"
+CONTENT_QUERY_CLOUD = "limit=50&expand=ancestors,children.attachment,history.lastUpdated,body.storage,space,space.permissions,restrictions.read.restrictions.user,restrictions.read.restrictions.group"
+# DC/Server: drop space.permissions (unused, and 500s per CONFSERVER-99908).
+CONTENT_QUERY_DATA_CENTER = "limit=50&expand=ancestors,children.attachment,history.lastUpdated,body.storage,space,restrictions.read.restrictions.user,restrictions.read.restrictions.group"
 SEARCH_QUERY = "limit=100&expand=content.history,content.extensions,content.container,content.space,content.body.storage,space.description,space.history"
 USER_QUERY = "expand=groups,applicationRoles"
 LABEL = "label"
@@ -29,6 +34,7 @@ URLS = {
     SPACE: "rest/api/space?{api_query}",
     SPACE_PERMISSION: "rest/extender/1.0/permission/space/{space_key}/getSpacePermissionActors/VIEWSPACE",
     CONTENT: "rest/api/content/search?{api_query}",
+    CONTENT_RESTRICTION: "rest/api/content/{id}/restriction/byOperation/read?expand=restrictions.user,restrictions.group",
     ATTACHMENT: "rest/api/content/{id}/child/attachment?{api_query}",
     SEARCH: "rest/api/search?cql={query}",
     SEARCH_FOR_DATA_CENTER: "rest/api/search?cql={query}&start={start}",

@@ -5,13 +5,11 @@
 #
 
 import asyncio
-import os
+import ssl
 from functools import cached_property
 
-import aiofiles
 import aiohttp
 import requests.adapters
-from aiofiles.os import remove
 from connectors_sdk.logger import logger
 from exchangelib import (
     IMPERSONATION,
@@ -23,14 +21,16 @@ from exchangelib import (
     Identity,
     OAuth2Credentials,
 )
+from exchangelib.errors import ErrorFolderNotFound, ErrorManagedFolderNotFound
+from exchangelib.folders import BaseFolder, Calendar, Messages
+from exchangelib.items import Item
 from exchangelib.protocol import BaseProtocol, NoVerifyHTTPAdapter
 from ldap3 import SAFE_SYNC, Connection, Server
 
 from connectors.sources.outlook.constants import (
     API_SCOPE,
     CALENDAR_FIELDS,
-    CERT_FILE,
-    CONTACT_FIELDS,
+    CONTACT_FOLDER_FIELDS,
     EWS_ENDPOINT,
     MAIL_FIELDS,
     MAIL_TYPES,
@@ -49,6 +49,27 @@ from connectors.utils import (
     retryable,
     url_encode,
 )
+
+# Folder-absent faults: skip the folder, keep syncing.
+FOLDER_SKIP_ERRORS = (ErrorFolderNotFound, ErrorManagedFolderNotFound)
+
+# exchangelib raises ValueError on unrecognised item tags (e.g. a stray
+# EndTimeZone). Degrade to Item so the sync continues; folder allowlists skip it.
+_reported_unexpected_item_tags = set()
+
+
+@classmethod
+def _tolerant_item_model_from_tag(cls, tag):
+    try:
+        return cls.ITEM_MODEL_MAP[tag]
+    except KeyError:
+        if tag not in _reported_unexpected_item_tags:
+            _reported_unexpected_item_tags.add(tag)
+            logger.warning(f"Unexpected EWS item tag {tag}; skipping")
+        return Item
+
+
+BaseFolder.item_model_from_tag = _tolerant_item_model_from_tag
 
 
 class TokenFetchFailed(Exception):
@@ -77,37 +98,37 @@ class NotFound(Exception):
     pass
 
 
-class SSLFailed(Exception):
+class SSLCertificateError(Exception):
+    """Raised when SSL is enabled but the CA certificate is missing or unusable."""
+
     pass
 
 
-class ManageCertificate:
-    async def store_certificate(self, certificate):
-        async with aiofiles.open(CERT_FILE, "w") as file:
-            await file.write(certificate)
-
-    def get_certificate_path(self):
-        return os.path.join(os.getcwd(), CERT_FILE)
-
-    async def remove_certificate_file(self):
-        if os.path.exists(CERT_FILE):
-            await remove(CERT_FILE)
+def _extract_ldap_mail(attributes):
+    mail = attributes.get("mail")
+    if isinstance(mail, list):
+        mail = mail[0] if mail else None
+    if not mail:
+        return None
+    return mail
 
 
-class RootCAAdapter(requests.adapters.HTTPAdapter):
-    """Class to verify SSL Certificate for Exchange Servers"""
+class InMemoryCAAdapter(requests.adapters.HTTPAdapter):
+    """HTTP adapter that verifies Exchange server TLS using an in-memory CA."""
 
-    def cert_verify(self, conn, url, verify, cert):
-        try:
-            super().cert_verify(
-                conn=conn,
-                url=url,
-                verify=ManageCertificate().get_certificate_path(),
-                cert=cert,
-            )
-        except Exception as exception:
-            msg = f"Something went wrong while verifying SSL certificate. Error: {exception}"
-            raise SSLFailed(msg) from exception
+    ssl_context: ssl.SSLContext | None = None
+
+    def init_poolmanager(self, *args, **kwargs):
+        ssl_context = type(self).ssl_context
+        if ssl_context is not None:
+            kwargs["ssl_context"] = ssl_context
+        return super().init_poolmanager(*args, **kwargs)
+
+    def proxy_manager_for(self, *args, **kwargs):
+        ssl_context = type(self).ssl_context
+        if ssl_context is not None:
+            kwargs["ssl_context"] = ssl_context
+        return super().proxy_manager_for(*args, **kwargs)
 
 
 class ExchangeUsers:
@@ -135,7 +156,7 @@ class ExchangeUsers:
         )
 
     async def close(self):
-        await ManageCertificate().remove_certificate_file()
+        pass
 
     def _fetch_normal_users(self, search_query):
         try:
@@ -190,10 +211,32 @@ class ExchangeUsers:
             yield user
 
     async def get_user_accounts(self):
-        await ManageCertificate().store_certificate(certificate=self.ssl_ca)
-        BaseProtocol.HTTP_ADAPTER_CLS = (
-            RootCAAdapter if self.ssl_enabled else NoVerifyHTTPAdapter
-        )
+        # exchangelib applies HTTP_ADAPTER_CLS (and our CA context) process-wide;
+        # safe because each connector uses a single CA.
+        if self.ssl_enabled:
+            # Fail loudly on a missing/unusable CA instead of silently using an
+            # unverified or system-CA connection.
+            if not self.ssl_ca:
+                msg = (
+                    "SSL is enabled for the Exchange server but no CA "
+                    "certificate was provided. Provide a valid PEM-encoded "
+                    "certificate."
+                )
+                raise SSLCertificateError(msg)
+            try:
+                InMemoryCAAdapter.ssl_context = ssl.create_default_context(
+                    cadata=self.ssl_ca
+                )
+            except (ssl.SSLError, ValueError) as exception:
+                msg = (
+                    "SSL is enabled for the Exchange server but the configured "
+                    "CA certificate could not be loaded. Provide a valid "
+                    "PEM-encoded certificate."
+                )
+                raise SSLCertificateError(msg) from exception
+            BaseProtocol.HTTP_ADAPTER_CLS = InMemoryCAAdapter
+        else:
+            BaseProtocol.HTTP_ADAPTER_CLS = NoVerifyHTTPAdapter
 
         credentials = Credentials(
             username=self.user,
@@ -206,11 +249,19 @@ class ExchangeUsers:
         )
 
         async for user in self.get_users():
-            if "searchResRef" in user["type"]:
+            if "searchResRef" in user.get("type", ""):
+                continue
+
+            mail = _extract_ldap_mail(user.get("attributes", {}))
+            if mail is None:
+                logger.warning(
+                    "Skipping Active Directory user without a valid mail attribute: "
+                    f"{user.get('dn', 'unknown')}"
+                )
                 continue
 
             user_account = Account(
-                primary_smtp_address=user.get("attributes", {}).get("mail"),
+                primary_smtp_address=mail,
                 config=configuration,
                 access_type=IMPERSONATION,
             )
@@ -377,38 +428,114 @@ class OutlookClient:
             self._logger.debug(
                 f"Fetching {mail_type['folder']} mails for {account.primary_smtp_address}"
             )
-            if mail_type["folder"] == "archive":
-                # If 'Archive' folder is not present, skipping the iteration
-                try:
-                    folder_object = (
-                        account.root / "Top of Information Store" / "Archive"
+            try:
+                # Resolve folders off the event loop (blocking exchangelib call).
+                if mail_type["folder"] == "archive":
+                    # "Archive" has no distinguished ID; resolve by name, skip if absent.
+                    folder_object = await asyncio.to_thread(
+                        lambda: account.msg_folder_root / "Archive"
                     )
-                except Exception:  # noqa S112
-                    continue
-            else:
-                folder_object = getattr(account, mail_type["folder"])
+                    # A non-mail "Archive" folder can't take MAIL_FIELDS.
+                    if not isinstance(folder_object, Messages):
+                        self._logger.debug(
+                            f"Skipping 'Archive' folder for {account.primary_smtp_address}: "
+                            f"not a mail folder ({type(folder_object).__name__})"
+                        )
+                        continue
+                else:
+                    folder_object = await asyncio.to_thread(
+                        getattr, account, mail_type["folder"]
+                    )
+            except FOLDER_SKIP_ERRORS:
+                self._logger.warning(
+                    f"Could not resolve {mail_type['folder']} folder for "
+                    f"{account.primary_smtp_address}, skipping."
+                )
+                continue
 
-            for mail in await asyncio.to_thread(folder_object.all().only, *MAIL_FIELDS):
+            # Materialize the queryset in the thread; iterating it lazily would
+            # run the blocking EWS fetch back on the event loop.
+            mails = await asyncio.to_thread(
+                lambda folder=folder_object: list(folder.all().only(*MAIL_FIELDS))
+            )
+            for mail in mails:
                 yield mail, mail_type
 
     async def get_calendars(self, account):
-        for calendar in await asyncio.to_thread(
-            account.calendar.all().only, *CALENDAR_FIELDS
-        ):
+        # Resolve the folder off the event loop (blocking call); skip if absent.
+        try:
+            folder = await asyncio.to_thread(getattr, account, "calendar")
+        except FOLDER_SKIP_ERRORS:
+            self._logger.warning(
+                f"Could not resolve Calendar folder for {account.primary_smtp_address}, skipping."
+            )
+            return
+        # Materialize the queryset in the thread; lazy iteration would run the
+        # blocking EWS fetch back on the event loop.
+        calendars = await asyncio.to_thread(
+            lambda: list(folder.all().only(*CALENDAR_FIELDS))
+        )
+        for calendar in calendars:
             yield calendar
 
     async def get_child_calendars(self, account):
-        for child_calendar in account.calendar.children:
-            for calendar in await asyncio.to_thread(
-                child_calendar.all().only, *CALENDAR_FIELDS
-            ):
+        # Resolve folder and children off the event loop; skip if absent.
+        try:
+            child_calendars = await asyncio.to_thread(
+                lambda: list(account.calendar.children)
+            )
+        except FOLDER_SKIP_ERRORS:
+            self._logger.warning(
+                f"Could not resolve Calendar folder for {account.primary_smtp_address}, "
+                "skipping child calendars."
+            )
+            return
+        for child_calendar in child_calendars:
+            # A non-calendar child can't take CALENDAR_FIELDS; skip it up front.
+            if not isinstance(child_calendar, Calendar):
+                self._logger.debug(
+                    f"Skipping non-calendar child folder "
+                    f"{getattr(child_calendar, 'name', 'unknown')} "
+                    f"({type(child_calendar).__name__}) for {account.primary_smtp_address}"
+                )
+                continue
+            # Materialize the queryset in the thread; lazy iteration would run the
+            # blocking EWS fetch back on the event loop.
+            calendars = await asyncio.to_thread(
+                lambda child=child_calendar: list(child.all().only(*CALENDAR_FIELDS))
+            )
+            for calendar in calendars:
                 yield calendar, child_calendar
 
     async def get_tasks(self, account):
-        for task in await asyncio.to_thread(account.tasks.all().only, *TASK_FIELDS):
+        # Resolve the folder off the event loop (blocking call); skip if absent.
+        try:
+            folder = await asyncio.to_thread(getattr, account, "tasks")
+        except FOLDER_SKIP_ERRORS:
+            self._logger.warning(
+                f"Could not resolve Tasks folder for {account.primary_smtp_address}, skipping."
+            )
+            return
+        # Materialize the queryset in the thread; lazy iteration would run the
+        # blocking EWS fetch back on the event loop.
+        tasks = await asyncio.to_thread(lambda: list(folder.all().only(*TASK_FIELDS)))
+        for task in tasks:
             yield task
 
     async def get_contacts(self, account):
-        folder = account.root / "Top of Information Store" / "Contacts"
-        for contact in await asyncio.to_thread(folder.all().only, *CONTACT_FIELDS):
+        # account.contacts uses a locale-agnostic distinguished folder ID; resolve
+        # it off the event loop (blocking call); skip if absent.
+        try:
+            folder = await asyncio.to_thread(getattr, account, "contacts")
+        except FOLDER_SKIP_ERRORS:
+            self._logger.warning(
+                f"Could not resolve Contacts folder for {account.primary_smtp_address}, skipping."
+            )
+            return
+        # Materialize the queryset in the thread; lazy iteration would run the
+        # blocking EWS fetch back on the event loop.
+        contacts = await asyncio.to_thread(
+            lambda: list(folder.all().only(*CONTACT_FOLDER_FIELDS))
+        )
+        for contact in contacts:
             yield contact
